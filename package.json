@@ -1,0 +1,15 @@
+{
+  "name": "instagram-auto-capture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Log into Instagram, navigate to a URL, and save screenshot + HTML + CSS dump.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "puppeteer": "^23.11.1"
+  }
+}
+

@@ -1,0 +1,7 @@
+.env
+node_modules/
+output/
+chrome-profile/
+.DS_Store
+
+src/extensions/
