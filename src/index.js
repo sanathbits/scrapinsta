@@ -17,6 +17,7 @@ const HOUR_MS = 60 * MINUTE_MS;
 
 // Global JSON log for processed reel links
 const ALL_REEL_PATH = path.resolve(process.cwd(), "output", "Allreel.json");
+const ALL_PROFILES_PATH = path.resolve(process.cwd(), "output", "allProfiles.json");
 const DOWNLOAD_DIR = path.join(process.env.HOME || process.cwd(), "Downloads");
 
 // External API for Instagram user list
@@ -27,6 +28,10 @@ const INSTA_USER_LIST_TOKEN = process.env.INSTA_USER_LIST_TOKEN || "";
 // External API for media upload (MP4/MP3)
 const UPLOAD_MEDIA_API_URL =
   "https://api-viralx.enpointe.io/api/v1/external/upload/media";
+
+// External API for profile update (PUT by username)
+const UPDATE_PROFILE_BASE_URL =
+  "https://api-viralx.enpointe.io/api/v1/external/updateProfileById";
 
 async function loadAllReels() {
   try {
@@ -714,6 +719,68 @@ async function getUserList() {
   return body.data;
 }
 
+/**
+ * Reads output/allProfiles.json and PUTs each profile to the external API.
+ * PUT {base}/updateProfileById/{username} with JSON body: instagram_user_id, full_name, is_verified, biography, profile_pic_url, follower_count, following_count, media_count.
+ */
+async function updateUserProfiles() {
+  if (!INSTA_USER_LIST_TOKEN) {
+    console.warn("INSTA_USER_LIST_TOKEN not set; skip updateUserProfiles.");
+    return;
+  }
+  let profiles = [];
+  try {
+    const raw = await fs.readFile(ALL_PROFILES_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    profiles = Array.isArray(parsed) ? parsed : [parsed];
+  } catch (err) {
+    console.error("Failed to read allProfiles.json:", err.message);
+    return;
+  }
+  if (profiles.length === 0) {
+    console.log("updateUserProfiles: no profiles in allProfiles.json");
+    return;
+  }
+  for (const p of profiles) {
+    const username = p.username;
+    if (!username) continue;
+    const body = {
+      instagram_user_id: p.instagram_user_id ?? ("sb_"+username).toLowerCase(),
+      full_name: p.full_name ?? username,
+      is_verified: p.is_verified ?? false,
+      biography: p.biography ?? "",
+      profile_pic_url: p.profile_pic_url ?? "",
+      follower_count: p.followers ?? p.follower_count ?? 0,
+      following_count: p.following ?? p.following_count ?? 0,
+      media_count: p.posts ?? p.media_count ?? 0,
+    };
+    const url = `${UPDATE_PROFILE_BASE_URL}/${encodeURIComponent(username)}`;
+    try {
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        console.error(
+          "updateProfileById failed:",
+          username,
+          res.status,
+          res.statusText,
+          await res.text()
+        );
+        continue;
+      }
+      console.log("Updated profile:", username);
+    } catch (err) {
+      console.error("updateProfileById error for", username, ":", err.message);
+    }
+  }
+}
+
 async function getUserData({ browser, page, targetUrl, outDir }) {
   // First run: open Instagram headful so user can log in manually; session saved in PROFILE_DIR.
   const profileDir = resolveProfileDir();
@@ -749,7 +816,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
 
   const usernameArray = [];//await getUserList();
   if (usernameArray.length === 0) {
-    usernameArray.push("thenawazshaikh"); // fallback
+    usernameArray.push("santoshbhagat"); // fallback
   }
 
     const combined = [];
@@ -790,11 +857,13 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
       console.log(`Saved:\n- ${htmlPath}\n- ${statsPath}`);
     }
 
-    const combinedPath = path.join(outDir, "profiles.json");
+    const combinedPath = ALL_PROFILES_PATH;
     await fs.writeFile(combinedPath, JSON.stringify(combined, null, 2), "utf8");
     console.log(`Combined:\n- ${combinedPath}`);
    
-    convertMP4toMP3();
+    await convertMP4toMP3();
+    await sleep(1000);
+   
 }
 async function convertMP4toMP3() {
   console.log("Converting MP4 to MP3 based on Allreel.json");
@@ -837,6 +906,7 @@ async function convertMP4toMP3() {
 
   if (changed) {
     await saveAllReels(reels);
+    await updateUserProfiles();
     userDataRetrival=false;
     console.log("Allreel.json updated with MP3 paths.");
   } else {
@@ -849,6 +919,15 @@ async function convertMP4toMP3() {
  * @param {string} filePath - Absolute path to the file (e.g. .mp4 or .mp3)
  * @returns {Promise<string|null>} Server URL or media identifier from response, or null on failure
  */
+// MIME types the server accepts (audio: mp3, wav, m4a | video: mp4, mov)
+const UPLOAD_MIME_BY_EXT = {
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".m4a": "audio/mp4",
+};
+
 async function uploadFileToServer(filePath) {
   if (!INSTA_USER_LIST_TOKEN) {
     console.warn("INSTA_USER_LIST_TOKEN not set; skip upload.");
@@ -857,7 +936,9 @@ async function uploadFileToServer(filePath) {
   try {
     console.log("Uploading file to server:", filePath);
     const buffer = await fs.readFile(filePath);
-    const blob = new Blob([buffer]);
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeType = UPLOAD_MIME_BY_EXT[ext] || "application/octet-stream";
+    const blob = new Blob([buffer], { type: mimeType });
     const form = new FormData();
     form.append("file", blob, path.basename(filePath));
 
@@ -1172,9 +1253,14 @@ let targetGoogleKeepAliveCount=15;
 
 let userDataRetrival=false
 
-let maxLinksPerUser=10;
+let maxLinksPerUser=1;
 
 main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
+
+
+
+// uploadFileToServer("/Users/santoshbhagat/Downloads/Video-49.mp4")
