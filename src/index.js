@@ -147,6 +147,19 @@ function parseProfileStatsFromHtml(html) {
   const followingRaw = find("following");
   const postsRaw = find("posts?");
 
+  // Profile picture: <img alt="username's profile picture" ... src="https://...">
+  let profilePicUrl = null;
+  const imgWithAlt = html.match(
+    /<img[^>]*?\salt="[^"]*profile picture[^"]*"[^>]*?\ssrc="([^"]+)"[^>]*>/i
+  );
+  if (imgWithAlt) profilePicUrl = decodeHtmlEntities(imgWithAlt[1]);
+  if (!profilePicUrl) {
+    const imgSrcFirst = html.match(
+      /<img[^>]*?\ssrc="([^"]+)"[^>]*?\salt="[^"]*profile picture[^"]*"[^>]*>/i
+    );
+    if (imgSrcFirst) profilePicUrl = decodeHtmlEntities(imgSrcFirst[1]);
+  }
+
   return {
     source: content ? "meta:description" : "none",
     postsRaw,
@@ -155,11 +168,54 @@ function parseProfileStatsFromHtml(html) {
     posts: normalizeCount(postsRaw),
     followers: normalizeCount(followersRaw),
     following: normalizeCount(followingRaw),
+    profilePicUrl: profilePicUrl || undefined,
   };
 }
 
-async function extractProfileStats(page, html) {
+/**
+ * Extracts profile stats (and profile picture URL) from page/html, optionally downloads the profile image to outDir.
+ * @param {import('puppeteer').Page} page
+ * @param {string} html
+ * @param {string} [username] - Used for saving profile image as profile-{username}.jpg and for DOM fallback
+ * @param {string} [outDir] - Folder to save downloaded profile picture (e.g. output/2026-01-29_17-52-58)
+ * @returns {Promise<{ profilePicUrl?: string, profilePicLocalPath?: string, ... }>}
+ */
+async function extractProfileStats(page, html, username, outDir) {
   const fromHtml = parseProfileStatsFromHtml(html);
+  let profilePicUrl = fromHtml.profilePicUrl;
+
+  // DOM fallback for profile pic if not in HTML (e.g. img with alt containing username's profile picture)
+  if (!profilePicUrl && page) {
+    profilePicUrl = await page
+      .evaluate(() => {
+        const img = Array.from(document.querySelectorAll("img[alt][src]")).find(
+          (el) => (el.getAttribute("alt") || "").includes(`${username}'s profile picture`)
+        );
+        return img ? img.getAttribute("src") : null;
+      })
+      .catch(() => null);
+  }
+
+  if (profilePicUrl && username && outDir) {
+    const ext = profilePicUrl.split(/[#?]/)[0].toLowerCase().endsWith(".png") ? "png" : "jpg";
+    const localPath = path.join(outDir, `profile-${username}.${ext}`);
+    try {
+      const res = await fetch(profilePicUrl);
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        await fs.writeFile(localPath, Buffer.from(buf));
+        fromHtml.profilePicUrl = profilePicUrl;
+        fromHtml.profilePicLocalPath = localPath;
+        console.log("Profile picture saved:", localPath);
+      }
+    } catch (e) {
+      console.warn("Profile picture download failed:", profilePicUrl, e.message);
+      fromHtml.profilePicUrl = profilePicUrl;
+    }
+  } else if (profilePicUrl) {
+    fromHtml.profilePicUrl = profilePicUrl;
+  }
+
   if (
     fromHtml.posts != null ||
     fromHtml.followers != null ||
@@ -190,7 +246,7 @@ async function extractProfileStats(page, html) {
   const followingRaw = findInText("following");
   const postsRaw = findInText("posts?");
 
-  return {
+  const fallbackResult = {
     source: "dom:visibleText",
     postsRaw,
     followersRaw,
@@ -198,7 +254,10 @@ async function extractProfileStats(page, html) {
     posts: normalizeCount(postsRaw),
     followers: normalizeCount(followersRaw),
     following: normalizeCount(followingRaw),
+    profilePicUrl: fromHtml.profilePicUrl,
+    profilePicLocalPath: fromHtml.profilePicLocalPath,
   };
+  return fallbackResult;
 }
 
 async function safeScreenshot(page, filePath, fullPage = true) {
@@ -816,7 +875,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
 
   const usernameArray = [];//await getUserList();
   if (usernameArray.length === 0) {
-    usernameArray.push("santoshbhagat"); // fallback
+    usernameArray.push("sk_faraz_9812"); // fallback
   }
 
     const combined = [];
@@ -829,7 +888,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
       const html = await page.content();
       await fs.writeFile(htmlPath, html, "utf8");
 
-      const stats = await extractProfileStats(page, html);
+      const stats = await extractProfileStats(page, html, username, outDir);
       const links = await extractUserHrefPaths(page, username);
       console.log(links);
       const filteredLinks = [];
@@ -907,6 +966,7 @@ async function convertMP4toMP3() {
   if (changed) {
     await saveAllReels(reels);
     await updateUserProfiles();
+
     userDataRetrival=false;
     console.log("Allreel.json updated with MP3 paths.");
   } else {
