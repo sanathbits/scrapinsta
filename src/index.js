@@ -19,6 +19,15 @@ const HOUR_MS = 60 * MINUTE_MS;
 const ALL_REEL_PATH = path.resolve(process.cwd(), "output", "Allreel.json");
 const DOWNLOAD_DIR = path.join(process.env.HOME || process.cwd(), "Downloads");
 
+// External API for Instagram user list
+const INSTA_USER_LIST_API_URL =
+  "https://api-viralx.enpointe.io/api/v1/external/getProfileInstaUserList";
+const INSTA_USER_LIST_TOKEN = process.env.INSTA_USER_LIST_TOKEN || "";
+
+// External API for media upload (MP4/MP3)
+const UPLOAD_MEDIA_API_URL =
+  "https://api-viralx.enpointe.io/api/v1/external/upload/media";
+
 async function loadAllReels() {
   try {
     const raw = await fs.readFile(ALL_REEL_PATH, "utf8");
@@ -677,6 +686,34 @@ async function googleKeepAlive(browser) {
   }
 }
 
+/**
+ * Fetches Instagram usernames from the external API.
+ * Expects response: { success: true, message: string, data: string[] }
+ * @returns {Promise<string[]>} Array of Instagram usernames
+ */
+async function getUserList() {
+  if (!INSTA_USER_LIST_TOKEN) {
+    console.warn("INSTA_USER_LIST_TOKEN not set; returning empty list.");
+    return [];
+  }
+  const res = await fetch(INSTA_USER_LIST_API_URL, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`getProfileInstaUserList failed: ${res.status} ${res.statusText}`);
+  }
+  const body = await res.json();
+  if (!body.success || !Array.isArray(body.data)) {
+    throw new Error(
+      body.message || "Invalid response: expected success and data array"
+    );
+  }
+  return body.data;
+}
+
 async function getUserData({ browser, page, targetUrl, outDir }) {
   // First run: open Instagram headful so user can log in manually; session saved in PROFILE_DIR.
   const profileDir = resolveProfileDir();
@@ -710,17 +747,10 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     }
   }
 
-    const usernameArray = [
-      "thenawazshaikh",
-      // "santoshbhagat",
-      // "sudhirkushwaha499",
-      "jitu.rik",
-      // "_krishmenath_07_",
-      // "tushar_hasule99",
-      // "tejaspunde",
-    ];
-
-    //const usernameArray = ["santoshbhagat"];
+  const usernameArray = [];//await getUserList();
+  if (usernameArray.length === 0) {
+    usernameArray.push("thenawazshaikh"); // fallback
+  }
 
     const combined = [];
     for (const username of usernameArray) {
@@ -763,7 +793,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     const combinedPath = path.join(outDir, "profiles.json");
     await fs.writeFile(combinedPath, JSON.stringify(combined, null, 2), "utf8");
     console.log(`Combined:\n- ${combinedPath}`);
-    userDataRetrival=false;
+   
     convertMP4toMP3();
 }
 async function convertMP4toMP3() {
@@ -775,7 +805,7 @@ async function convertMP4toMP3() {
   for (const entry of reels) {
     if (!entry.downloaded) continue;
     if (entry.isConverted) continue;
-    if (!entry.filePath || !entry.filePath.endsWith(".mp4")) continue;
+    if (!entry.filePath) continue;
 
     const inputPath = entry.filePath.replace(/\.crdownload$/i, "");
   
@@ -790,6 +820,13 @@ async function convertMP4toMP3() {
       );
 
       entry.mp3FilePath = outputPath;
+
+      let serverMP4Url = await uploadFileToServer(inputPath);
+      let serverMP3Url = await uploadFileToServer(outputPath);
+
+      entry.serverMP4Url = serverMP4Url;
+      entry.serverMP3Url = serverMP3Url;
+      
       entry.isConverted = true;
       changed = true;
       console.log("MP3 created:", outputPath);
@@ -800,9 +837,51 @@ async function convertMP4toMP3() {
 
   if (changed) {
     await saveAllReels(reels);
+    userDataRetrival=false;
     console.log("Allreel.json updated with MP3 paths.");
   } else {
     console.log("No MP4 entries required conversion.");
+  }
+}
+
+/**
+ * Uploads a single file to the external media API (multipart POST).
+ * @param {string} filePath - Absolute path to the file (e.g. .mp4 or .mp3)
+ * @returns {Promise<string|null>} Server URL or media identifier from response, or null on failure
+ */
+async function uploadFileToServer(filePath) {
+  if (!INSTA_USER_LIST_TOKEN) {
+    console.warn("INSTA_USER_LIST_TOKEN not set; skip upload.");
+    return null;
+  }
+  try {
+    console.log("Uploading file to server:", filePath);
+    const buffer = await fs.readFile(filePath);
+    const blob = new Blob([buffer]);
+    const form = new FormData();
+    form.append("file", blob, path.basename(filePath));
+
+    const res = await fetch(UPLOAD_MEDIA_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+      },
+      body: form,
+    });
+
+    if (!res.ok) {
+      console.error("Upload failed:", res.status, res.statusText, await res.text());
+      return null;
+    }
+
+    const result = await res.json();
+    const url =
+      result?.data?.url ?? result?.url ?? result?.data?.fileUrl ?? result?.fileUrl ?? null;
+    if (url) console.log("Uploaded:", filePath, "->", url);
+    return url;
+  } catch (err) {
+    console.error("Upload error for", filePath, ":", err.message);
+    return null;
   }
 }
 
@@ -1088,7 +1167,7 @@ let googleKeepAliveCount=16;
 
 console.log("userDataCount", userDataCount, "googleKeepAliveCount", googleKeepAliveCount);
 
-let targetUserDataCount=60;
+let targetUserDataCount=120;
 let targetGoogleKeepAliveCount=15;
 
 let userDataRetrival=false
