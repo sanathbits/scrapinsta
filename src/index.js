@@ -5,6 +5,10 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import puppeteer from "puppeteer";
 import dotenv from "dotenv";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import config from "./config.js";
+
+const ffmpegPath = ffmpegInstaller.path;
 
 const execAsync = promisify(exec);
 
@@ -15,23 +19,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 
-// Global JSON log for processed reel links
 const ALL_REEL_PATH = path.resolve(process.cwd(), "output", "Allreel.json");
 const ALL_PROFILES_PATH = path.resolve(process.cwd(), "output", "allProfiles.json");
 const DOWNLOAD_DIR = path.join(process.env.HOME || process.cwd(), "Downloads");
 
-// External API for Instagram user list
-const INSTA_USER_LIST_API_URL =
-  "https://api-viralx.enpointe.io/api/v1/external/getProfileInstaUserList";
-const INSTA_USER_LIST_TOKEN = process.env.INSTA_USER_LIST_TOKEN || "";
+const INSTA_USER_LIST_API_URL = config.instaUserListApiUrl;
+const INSTA_USER_LIST_TOKEN = process.env.INSTA_USER_LIST_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXJ2aWNlIjoiZXh0ZXJuYWwtc2VydmljZSIsImlhdCI6MTc2OTUyMzIzOSwiZXhwIjoxNzcyMTE1MjM5fQ.8UOhvJ-QBbsrod_gn-h0Z0uHz86MvDXBe4LIPeCTv1A";
+const UPLOAD_MEDIA_API_URL = config.uploadMediaApiUrl;
+const UPDATE_PROFILE_BASE_URL = config.updateProfileBaseUrl;
+const UPDATE_POSTS_BASE_URL = config.updatePostsBaseUrl;
 
-// External API for media upload (MP4/MP3)
-const UPLOAD_MEDIA_API_URL =
-  "https://api-viralx.enpointe.io/api/v1/external/upload/media";
-
-// External API for profile update (PUT by username)
-const UPDATE_PROFILE_BASE_URL =
-  "https://api-viralx.enpointe.io/api/v1/external/updateProfileById";
 
 async function loadAllReels() {
   try {
@@ -184,15 +181,16 @@ async function extractProfileStats(page, html, username, outDir) {
   const fromHtml = parseProfileStatsFromHtml(html);
   let profilePicUrl = fromHtml.profilePicUrl;
 
-  // DOM fallback for profile pic if not in HTML (e.g. img with alt containing username's profile picture)
-  if (!profilePicUrl && page) {
+  if (profilePicUrl && page && username) {
     profilePicUrl = await page
-      .evaluate(() => {
-        const img = Array.from(document.querySelectorAll("img[alt][src]")).find(
-          (el) => (el.getAttribute("alt") || "").includes(`${username}'s profile picture`)
-        );
+      .evaluate((u) => {
+        const imgs = Array.from(document.querySelectorAll("main img[alt][src]"));
+        const img = imgs.find((el) => {
+          const alt = (el.getAttribute("alt") || "").trim();
+          return alt === `${u}'s profile picture` || (u && alt.endsWith("'s profile picture") && alt.startsWith(u));
+        });
         return img ? img.getAttribute("src") : null;
-      })
+      }, username)
       .catch(() => null);
   }
 
@@ -337,8 +335,8 @@ async function clickButtonByExactText(page, text, timeoutMs = 2000) {
 
 async function handleCommonInstagramPostLoginDialogs(page) {
   // These dialogs vary by locale/account. Best-effort.
-  await clickButtonByExactText(page, "Not Now").catch(() => {});
-  await clickButtonByExactText(page, "Not now").catch(() => {});
+  await clickButtonByExactText(page, "Not Now").catch(() => { });
+  await clickButtonByExactText(page, "Not now").catch(() => { });
 }
 
 async function isInstagramLoggedIn(page) {
@@ -419,13 +417,13 @@ async function loginInstagram(page, username, password, outDir) {
   });
 
   // Cookie banners can block interactions. Best-effort dismissals.
-  await clickButtonByExactText(page, "Allow all cookies", 1500).catch(() => {});
+  await clickButtonByExactText(page, "Allow all cookies", 1500).catch(() => { });
   await clickButtonByExactText(
     page,
     "Only allow essential cookies",
     1500
-  ).catch(() => {});
-  await clickButtonByExactText(page, "Accept all", 1500).catch(() => {});
+  ).catch(() => { });
+  await clickButtonByExactText(page, "Accept all", 1500).catch(() => { });
 
   if (process.env.DEBUG_LOGIN === "1") {
     await safeScreenshot(page, path.join(outDir, "login-01-loaded.png"), true);
@@ -452,7 +450,7 @@ async function loginInstagram(page, username, password, outDir) {
       },
       { timeout: 10_000 }
     )
-    .catch(() => {});
+    .catch(() => { });
 
   const clicked =
     (await clickButtonByExactText(page, "Log in", 3000)) ||
@@ -647,7 +645,7 @@ async function launchBrowser({ headful, profileDir, args, executablePath, retrie
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
   ];
-  
+
   const launchOptions = {
     headless: !headful,
     userDataDir: profileDir,
@@ -655,11 +653,11 @@ async function launchBrowser({ headful, profileDir, args, executablePath, retrie
     ignoreDefaultArgs: false,
     timeout: 60000, // 60 second timeout
   };
-  
+
   if (executablePath) {
     launchOptions.executablePath = executablePath;
   }
-  
+
   // Retry logic with exponential backoff
   let lastError;
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -679,7 +677,7 @@ async function launchBrowser({ headful, profileDir, args, executablePath, retrie
       }
     }
   }
-  
+
   throw lastError;
 }
 
@@ -722,15 +720,15 @@ async function googleKeepAlive(browser) {
     await tab.goto(url, { waitUntil: "domcontentloaded" });
     await sleep(2500);
     // tiny scroll to look "human"
-    await tab.evaluate(() => window.scrollBy(0, 300)).catch(() => {});
+    await tab.evaluate(() => window.scrollBy(0, 300)).catch(() => { });
     await sleep(1500);
 
     // Scroll down then up to look more human (best-effort; ignore failures)
     await tab
       .evaluate(() => window.scrollTo(0, document.body.scrollHeight))
-      .catch(() => {});
+      .catch(() => { });
     await sleep(1200);
-    await tab.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    await tab.evaluate(() => window.scrollTo(0, 0)).catch(() => { });
     await sleep(1200);
 
     await sleep(2500);
@@ -740,13 +738,13 @@ async function googleKeepAlive(browser) {
     // Scroll down then up to look more human (best-effort; ignore failures)
     await tab
       .evaluate(() => window.scrollTo(0, document.body.scrollHeight))
-      .catch(() => {});
+      .catch(() => { });
     await sleep(1200);
-    await tab.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    await tab.evaluate(() => window.scrollTo(0, 0)).catch(() => { });
     await sleep(1200);
 
     await sleep(2500);
-    await tab.close().catch(() => {});
+    await tab.close().catch(() => { });
   }
 }
 
@@ -803,12 +801,29 @@ async function updateUserProfiles() {
   for (const p of profiles) {
     const username = p.username;
     if (!username) continue;
+    let profilePicUrl = p.profile_pic_url ?? p.profilePicUrl ?? "";
+    const localPath = p.profilePicLocalPath;
+    if (localPath) {
+      try {
+        await fs.access(localPath);
+        const uploaded = await uploadFileToServer(localPath);
+        if (uploaded) profilePicUrl = uploaded;
+      } catch {
+        if (p.profilePicUrl) {
+          const uploaded = await uploadImageFromUrlToServer(p.profilePicUrl);
+          if (uploaded) profilePicUrl = uploaded;
+        }
+      }
+    } else if (p.profilePicUrl) {
+      const uploaded = await uploadImageFromUrlToServer(p.profilePicUrl);
+      if (uploaded) profilePicUrl = uploaded;
+    }
     const body = {
-      instagram_user_id: p.instagram_user_id ?? ("sb_"+username).toLowerCase(),
+      instagram_user_id: p.instagram_user_id ?? ("sb_" + username).toLowerCase(),
       full_name: p.full_name ?? username,
       is_verified: p.is_verified ?? false,
       biography: p.biography ?? "",
-      profile_pic_url: p.profile_pic_url ?? "",
+      profile_pic_url: profilePicUrl,
       follower_count: p.followers ?? p.follower_count ?? 0,
       following_count: p.following ?? p.following_count ?? 0,
       media_count: p.posts ?? p.media_count ?? 0,
@@ -873,56 +888,55 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     }
   }
 
-  const usernameArray = [];//await getUserList();
+  const usernameArray = await getUserList();
   if (usernameArray.length === 0) {
-    usernameArray.push("sk_faraz_9812"); // fallback
+    usernameArray.push("santoshbhagat"); // fallback
   }
 
-    const combined = [];
-    for (const username of usernameArray) {
-      const url = new URL(username + "/reels/", targetUrl).toString();
-      await page.goto(url, { waitUntil: "domcontentloaded" });
-      await sleep(1500);
+  const combined = [];
+  for (const username of usernameArray) {
+    const url = new URL(username + "/reels/", targetUrl).toString();
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await sleep(1500);
 
-      const htmlPath = path.join(outDir, `page-${username}.html`);
-      const html = await page.content();
-      await fs.writeFile(htmlPath, html, "utf8");
+    const htmlPath = path.join(outDir, `page-${username}.html`);
+    const html = await page.content();
+    await fs.writeFile(htmlPath, html, "utf8");
 
-      const stats = await extractProfileStats(page, html, username, outDir);
-      const links = await extractUserHrefPaths(page, username);
-      console.log(links);
-      const filteredLinks = [];
-      for (const obj of links) {
-        if (obj.href.includes("/reel/") && filteredLinks.length <= maxLinksPerUser) {
-          filteredLinks.push(obj.href);
-        }
+    const stats = await extractProfileStats(page, html, username, outDir);
+    const links = await extractUserHrefPaths(page, username);
+    console.log(links);
+    const filteredLinks = [];
+    for (const obj of links) {
+      if (obj.href.includes("/reel/") && filteredLinks.length < maxLinksPerUser) {
+        filteredLinks.push(obj.href);
       }
-
-      const record = { username, url, ...stats, hrefs: filteredLinks,links };
-      combined.push(record);
-      const statsPath = path.join(outDir, `profile-${username}.json`);
-      await fs.writeFile(statsPath, JSON.stringify(record, null, 2), "utf8");
-      const tasks = [];
-
-      for (const link of filteredLinks) {
-        const linkUrl = new URL(link, targetUrl).toString();
-        // Fire-and-forget: start tab immediately
-        const task = await processLinkInTab(browser, linkUrl);
-        await sleep(1000);
-        tasks.push(task);
-      }
-      await Promise.allSettled(tasks);
-
-      console.log(`Saved:\n- ${htmlPath}\n- ${statsPath}`);
     }
 
-    const combinedPath = ALL_PROFILES_PATH;
-    await fs.writeFile(combinedPath, JSON.stringify(combined, null, 2), "utf8");
-    console.log(`Combined:\n- ${combinedPath}`);
-   
-    await convertMP4toMP3();
-    await sleep(1000);
-   
+    const record = { username, url, ...stats, hrefs: filteredLinks, links };
+    combined.push(record);
+    const statsPath = path.join(outDir, `profile-${username}.json`);
+    await fs.writeFile(statsPath, JSON.stringify(record, null, 2), "utf8");
+    const tasks = [];
+
+    for (const link of filteredLinks) {
+      const linkUrl = new URL(link, targetUrl).toString();
+      const task = await processLinkInTab(browser, linkUrl, outDir);
+      await sleep(1000);
+      tasks.push(task);
+    }
+    await Promise.allSettled(tasks);
+
+    console.log(`Saved:\n- ${htmlPath}\n- ${statsPath}`);
+  }
+
+  const combinedPath = ALL_PROFILES_PATH;
+  await fs.writeFile(combinedPath, JSON.stringify(combined, null, 2), "utf8");
+  console.log(`Combined:\n- ${combinedPath}`);
+
+  await convertMP4toMP3();
+  await sleep(1000);
+
 }
 async function convertMP4toMP3() {
   console.log("Converting MP4 to MP3 based on Allreel.json");
@@ -936,25 +950,57 @@ async function convertMP4toMP3() {
     if (!entry.filePath) continue;
 
     const inputPath = entry.filePath.replace(/\.crdownload$/i, "");
-  
-    const outputPath =
-      entry.mp3FilePath ||
-      inputPath.replace(/\.mp4$/i, ".mp3");
+
+    // Ensure we have a distinct output path ending in .mp3
+    const outputPath = entry.mp3FilePath ||
+      `${inputPath.replace(/\.[^/.]+$/, "")}.mp3`;
+
+    // If somehow input and output are same (e.g. no extension originally), append .mp3
+    const finalOutputPath = (inputPath === outputPath) ? `${outputPath}.mp3` : outputPath;
 
     try {
-      console.log("Running ffmpeg for:", inputPath, "->", outputPath);
+      console.log("Running ffmpeg for:", inputPath, "->", finalOutputPath);
       await execAsync(
-        `ffmpeg -y -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${outputPath}"`
+        `"${ffmpegPath}" -y -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${finalOutputPath}"`
       );
 
-      entry.mp3FilePath = outputPath;
+      entry.mp3FilePath = finalOutputPath;
 
       let serverMP4Url = await uploadFileToServer(inputPath);
-      let serverMP3Url = await uploadFileToServer(outputPath);
+      let serverMP3Url = await uploadFileToServer(finalOutputPath);
 
       entry.serverMP4Url = serverMP4Url;
       entry.serverMP3Url = serverMP3Url;
-      
+
+      if (entry.thumbnailUrl) {
+        const uploadedThumb = await uploadImageFromUrlToServer(entry.thumbnailUrl);
+        if (uploadedThumb) entry.thumbnailUrl = uploadedThumb;
+      }
+
+      // Map stats from allProfiles.json
+      try {
+        const rawProfiles = await fs.readFile(ALL_PROFILES_PATH, "utf8");
+        const profiles = JSON.parse(rawProfiles);
+        const profileList = Array.isArray(profiles) ? profiles : [profiles];
+
+        for (const p of profileList) {
+          if (p.links && Array.isArray(p.links)) {
+            // Find the link object where the href matches the entry's linkUrl
+            // entry.linkUrl is absolute, link.href is relative
+            const statObj = p.links.find((l) => entry.linkUrl && entry.linkUrl.includes(l.href));
+            if (statObj) {
+              entry.likes = statObj.likes;
+              entry.views = statObj.views;
+              entry.comments = statObj.comments;
+              console.log(`Mapped stats for ${entry.linkUrl}: Likes=${entry.likes}, Views=${entry.views}, Comments=${entry.comments}`);
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Failed to map stats from allProfiles.json:", err.message);
+      }
+
       entry.isConverted = true;
       changed = true;
       console.log("MP3 created:", outputPath);
@@ -966,8 +1012,8 @@ async function convertMP4toMP3() {
   if (changed) {
     await saveAllReels(reels);
     await updateUserProfiles();
-
-    userDataRetrival=false;
+    await updateContentReels();
+    userDataRetrival = false;
     console.log("Allreel.json updated with MP3 paths.");
   } else {
     console.log("No MP4 entries required conversion.");
@@ -979,13 +1025,17 @@ async function convertMP4toMP3() {
  * @param {string} filePath - Absolute path to the file (e.g. .mp4 or .mp3)
  * @returns {Promise<string|null>} Server URL or media identifier from response, or null on failure
  */
-// MIME types the server accepts (audio: mp3, wav, m4a | video: mp4, mov)
 const UPLOAD_MIME_BY_EXT = {
   ".mp4": "video/mp4",
   ".mov": "video/quicktime",
   ".mp3": "audio/mpeg",
   ".wav": "audio/wav",
   ".m4a": "audio/mp4",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
 };
 
 async function uploadFileToServer(filePath) {
@@ -1026,6 +1076,152 @@ async function uploadFileToServer(filePath) {
   }
 }
 
+async function uploadImageFromUrlToServer(imageUrl) {
+  if (!INSTA_USER_LIST_TOKEN || !imageUrl) return null;
+  try {
+    const res = await fetch(imageUrl);
+    if (!res.ok) return null;
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const contentType = res.headers.get("content-type") || "image/jpeg";
+    const ext = contentType.includes("png") ? ".png" : contentType.includes("webp") ? ".webp" : contentType.includes("gif") ? ".gif" : ".jpg";
+    const mimeType = contentType.split(";")[0].trim() || "image/jpeg";
+    const blob = new Blob([buffer], { type: mimeType });
+    const form = new FormData();
+    form.append("file", blob, `image${ext}`);
+    const uploadRes = await fetch(UPLOAD_MEDIA_API_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}` },
+      body: form,
+    });
+    if (!uploadRes.ok) {
+      console.error("Image upload failed:", uploadRes.status, await uploadRes.text());
+      return null;
+    }
+    const result = await uploadRes.json();
+    const url = result?.data?.url ?? result?.url ?? result?.data?.fileUrl ?? result?.fileUrl ?? null;
+    if (url) console.log("Uploaded image from URL ->", url);
+    return url;
+  } catch (err) {
+    console.error("Upload image from URL error:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Helper to parse counts like "1.5M", "300K", "1,200" into numbers.
+ */
+function parseCount(str) {
+  if (!str) return 0;
+  // Remove commas
+  let clean = str.replace(/,/g, "").toUpperCase();
+  let multiplier = 1;
+  if (clean.endsWith("K")) {
+    multiplier = 1000;
+    clean = clean.slice(0, -1);
+  } else if (clean.endsWith("M")) {
+    multiplier = 1000000;
+    clean = clean.slice(0, -1);
+  } else if (clean.endsWith("B")) {
+    multiplier = 1000000000;
+    clean = clean.slice(0, -1);
+  }
+  const val = parseFloat(clean);
+  return isNaN(val) ? 0 : Math.floor(val * multiplier);
+}
+
+/**
+ * Reads Allreel.json, groups by username, and PUTs to the external API.
+ */
+async function updateContentReels() {
+  if (!INSTA_USER_LIST_TOKEN) {
+    console.warn("INSTA_USER_LIST_TOKEN not set; skip updateContentReels.");
+    return;
+  }
+
+  const reels = await loadAllReels();
+  if (reels.length === 0) {
+    console.log("updateContentReels: no reels in Allreel.json");
+    return;
+  }
+
+  // Group by username
+  // URL format: https://www.instagram.com/{username}/reel/{code}/
+  const reelsByUser = {};
+
+  for (const r of reels) {
+    if (!r.serverMP4Url) continue; // Only sync fully processed items?
+    try {
+      const u = new URL(r.linkUrl);
+      const parts = u.pathname.split("/").filter(Boolean);
+      // parts[0] is typically username, parts[1] 'reel', parts[2] code
+      // Adjust if URL structure differs, but standard is /username/reel/code/
+      if (parts.length < 3) continue;
+
+      const username = parts[0];
+      const code = parts[2];
+
+      if (!reelsByUser[username]) {
+        reelsByUser[username] = [];
+      }
+
+      reelsByUser[username].push({
+        entry: r,
+        code
+      });
+    } catch (e) {
+      console.warn("Skipping bad URL in updateContentReels:", r.linkUrl);
+    }
+  }
+
+  // Send PUT for each user
+  for (const [username, items] of Object.entries(reelsByUser)) {
+    const payloadReels = items.map(({ entry, code }) => ({
+      instagram_media_id: "sb_" + code,
+      code: code,
+      media_type: 2,
+      like_count: parseCount(entry.likes),
+      play_count: parseCount(entry.views),
+      comment_count: parseCount(entry.comments),
+      caption_text: entry.caption ?? "",
+      video_url: entry.serverMP4Url,
+      thumbnail_url: entry.thumbnailUrl ?? "",
+      video_duration: 0,
+      has_audio: true,
+      repost_count: entry.repostCount ?? 0,
+      reshare_count: entry.reshareCount ?? 0
+    }));
+
+    const url = `${UPDATE_POSTS_BASE_URL}/${encodeURIComponent(username)}`;
+    const body = { reels: payloadReels };
+
+    try {
+      console.log(`Updating posts for ${username} (${payloadReels.length} items)...`);
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        console.error(
+          "updateContentReels failed:",
+          username,
+          res.status,
+          res.statusText,
+          await res.text()
+        );
+      } else {
+        console.log("Updated posts successfully for:", username);
+      }
+    } catch (err) {
+      console.error("updateContentReels error for", username, ":", err.message);
+    }
+  }
+}
+
 async function runScheduled() {
   const targetUrl = getArgUrl();
   const profileDir = resolveProfileDir();
@@ -1047,7 +1243,7 @@ async function runScheduled() {
   const runEveryMs = Number.isFinite(runEveryMsRaw) ? runEveryMsRaw : HOUR_MS;
 
   const close = async () => {
-    await browser.close().catch(() => {});
+    await browser.close().catch(() => { });
   };
   process.on("SIGINT", async () => {
     console.log("SIGINT received, closing browser...");
@@ -1094,15 +1290,95 @@ async function runScheduled() {
   }
 }
 
-async function processLinkInTab(browser, linkUrl) {
-  // Skip if this reel link was already logged in Allreel.json
+function getReelPageUrl(linkUrl) {
+  try {
+    const u = new URL(linkUrl);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length >= 3 && parts[1] === "reel") {
+      return `https://www.instagram.com/reel/${parts[2]}/`;
+    }
+    if (parts.length >= 2 && parts[0] !== "reel" && parts[1] === "reel") {
+      return `https://www.instagram.com/reel/${parts[2]}/`;
+    }
+    const reelIdx = parts.indexOf("reel");
+    if (reelIdx >= 0 && parts[reelIdx + 1]) {
+      return `https://www.instagram.com/reel/${parts[reelIdx + 1]}/`;
+    }
+  } catch (e) {
+    return null;
+  }
+  return null;
+}
+
+async function scrapeReelMetadataFromPage(tab) {
+  return await tab
+    .evaluate(() => {
+      const out = {
+        caption: null,
+        thumbnailUrl: null,
+        likeCount: null,
+        commentCount: null,
+        viewCount: null,
+        repostCount: null,
+        reshareCount: null
+      };
+      const scripts = document.querySelectorAll('script[type="application/json"]');
+      for (const script of scripts) {
+        try {
+          const data = JSON.parse(script.textContent || "{}");
+          const findItem = (obj) => {
+            if (!obj || typeof obj !== "object") return null;
+            if (Object.prototype.hasOwnProperty.call(obj, "xdt_api__v1__media__shortcode__web_info")) {
+              const info = obj.xdt_api__v1__media__shortcode__web_info;
+              const items = info && info.items;
+              if (Array.isArray(items) && items.length > 0) return items[0];
+              return null;
+            }
+            for (const key of Object.keys(obj)) {
+              const val = findItem(obj[key]);
+              if (val != null) return val;
+            }
+            return null;
+          };
+          const item = findItem(data);
+          if (item) {
+            const cap = item.caption;
+            if (cap && typeof cap.text === "string") out.caption = cap.text.trim() || null;
+            if (typeof item.like_count === "number") out.likeCount = item.like_count;
+            if (typeof item.comment_count === "number") out.commentCount = item.comment_count;
+            if (typeof item.view_count === "number") out.viewCount = item.view_count;
+            if (typeof item.media_repost_count === "number") {
+              out.repostCount = item.media_repost_count;
+              out.reshareCount = item.media_repost_count;
+            }
+            break;
+          }
+        } catch (e) {}
+      }
+      const ogImage = document.querySelector('meta[property="og:image"]');
+      if (ogImage && ogImage.getAttribute("content")) {
+        out.thumbnailUrl = ogImage.getAttribute("content");
+      }
+      return out;
+    })
+    .catch(() => ({
+      caption: null,
+      thumbnailUrl: null,
+      likeCount: null,
+      commentCount: null,
+      viewCount: null,
+      repostCount: null,
+      reshareCount: null
+    }));
+}
+
+async function processLinkInTab(browser, linkUrl, outDir) {
   const existingList = await loadAllReels();
   if (existingList.some((e) => e.linkUrl === linkUrl && e.downloaded)) {
     console.log("Skipping already processed reel:", linkUrl);
     return;
   }
 
-  // Ensure an entry exists before attempting download
   await upsertReelEntry(linkUrl, (entry) => {
     entry.downloaded = false;
   });
@@ -1111,7 +1387,41 @@ async function processLinkInTab(browser, linkUrl) {
   await tab.setViewport({ width: 1280, height: 720 });
 
   try {
-    console.log("Opened tab for:", linkUrl);
+    const reelPageUrl = getReelPageUrl(linkUrl);
+    if (reelPageUrl) {
+      console.log("Opening reel page:", reelPageUrl);
+      await tab.goto(reelPageUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+      });
+      await tab.waitForSelector("main", { timeout: 15_000 }).catch(() => null);
+      await sleep(3000);
+      if (outDir) {
+        const parts = new URL(reelPageUrl).pathname.split("/").filter(Boolean);
+        const reelId = (parts[parts.length - 1] || parts[2] || "reel").replace(/[^a-zA-Z0-9_-]/g, "");
+        const reelHtmlPath = path.join(outDir, `reel-${reelId}.html`);
+        await fs.mkdir(outDir, { recursive: true });
+        const html = await tab.content();
+        await fs.writeFile(reelHtmlPath, html, "utf8");
+        console.log("Saved reel page HTML:", reelHtmlPath);
+      }
+      const meta = await scrapeReelMetadataFromPage(tab);
+      await upsertReelEntry(linkUrl, (e) => {
+        if (meta.caption != null) e.caption = meta.caption;
+        if (meta.thumbnailUrl != null) e.thumbnailUrl = meta.thumbnailUrl;
+        if (meta.likeCount != null) e.likes = String(meta.likeCount);
+        if (meta.commentCount != null) e.comments = String(meta.commentCount);
+        if (meta.viewCount != null) e.views = String(meta.viewCount);
+        if (meta.repostCount != null) {
+          e.repostCount = meta.repostCount;
+          e.reshareCount = meta.reshareCount != null ? meta.reshareCount : meta.repostCount;
+        }
+      });
+    } else {
+      console.warn("Could not build reel page URL for:", linkUrl);
+    }
+
+    console.log("Opening fastvideosave for:", linkUrl);
 
     await tab.goto("https://fastvideosave.net/", {
       waitUntil: "domcontentloaded",
@@ -1168,7 +1478,7 @@ async function processLinkInTab(browser, linkUrl) {
   } catch (e) {
     console.error("Tab failed:", linkUrl, e.message);
   } finally {
-    await tab.close().catch(() => {});
+    await tab.close().catch(() => { });
   }
   // Do not close immediately if downloads are needed
   // await tab.close().catch(() => {});
@@ -1188,11 +1498,11 @@ async function getInstagramData() {
     console.error("Browser not initialized");
     return;
   }
-  
+
   const targetUrl = getArgUrl();
   const outDir = path.resolve(process.cwd(), "output", tsDirName());
   await fs.mkdir(outDir, { recursive: true });
-  
+
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 720 });
   try {
@@ -1200,7 +1510,7 @@ async function getInstagramData() {
     // await waitForInstagramLoggedIn(page);
     await getUserData({ browser, page, targetUrl, outDir });
   } finally {
-    await page.close().catch(() => {});
+    await page.close().catch(() => { });
   }
 }
 
@@ -1222,14 +1532,14 @@ async function checkChromeProcesses(profileDir) {
   return false;
 }
 
-let browser=null;
+let browser = null;
 async function main() {
   try {
     const profileDir = resolveProfileDir();
     await fs.mkdir(profileDir, { recursive: true });
-    
+
     console.log(`Launching browser with profile: ${profileDir}`);
-    
+
     // Check for existing Chrome processes
     const hasChromeRunning = await checkChromeProcesses(profileDir);
     if (hasChromeRunning) {
@@ -1237,9 +1547,9 @@ async function main() {
       console.warn("   Please close Chrome and try again, or wait 5 seconds...");
       await sleep(5000);
     }
-    
-    browser = await launchBrowser({ 
-      headful: true, 
+
+    browser = await launchBrowser({
+      headful: true,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -1249,9 +1559,9 @@ async function main() {
       profileDir,
       retries: 3
     });
-    
+
     console.log("✅ Browser launched successfully");
-    
+
     // Verify browser is working
     const testPage = await browser.newPage();
     await testPage.close();
@@ -1277,14 +1587,14 @@ async function main() {
         console.error("Browser disconnected, exiting...");
         process.exit(1);
       }
-      
+
       console.log("Running loop userDataCount", userDataCount, "googleKeepAliveCount", googleKeepAliveCount, "userDataRetrival", userDataRetrival);
-      if(!userDataRetrival){
+      if (!userDataRetrival) {
         userDataCount++;
         googleKeepAliveCount++;
         if (userDataCount >= targetUserDataCount) {
           userDataCount = 0;
-          userDataRetrival=true;
+          userDataRetrival = true;
           await getInstagramData();
         } else if (googleKeepAliveCount >= targetGoogleKeepAliveCount) {
           googleKeepAliveCount = 0;
@@ -1295,7 +1605,7 @@ async function main() {
       console.error("Error in main loop:", error.message);
     }
   }, 1 * 60 * 1000);
-  
+
   await getInstagramData();
   // convertMP4toMP3();
 }
@@ -1303,17 +1613,17 @@ async function main() {
 const currentMinute = new Date().getMinutes();
 console.log("Current minute of the system:", currentMinute);
 
-let userDataCount=currentMinute;
-let googleKeepAliveCount=16;
+let userDataCount = currentMinute;
+let googleKeepAliveCount = 16;
 
 console.log("userDataCount", userDataCount, "googleKeepAliveCount", googleKeepAliveCount);
 
-let targetUserDataCount=120;
-let targetGoogleKeepAliveCount=15;
+let targetUserDataCount = 120;
+let targetGoogleKeepAliveCount = 15;
 
-let userDataRetrival=false
+let userDataRetrival = false
 
-let maxLinksPerUser=1;
+let maxLinksPerUser = 120;
 
 main().catch((err) => {
   console.error(err);
