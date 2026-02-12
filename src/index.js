@@ -888,7 +888,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     }
   }
 
-  let usernameArray = ["orellryan"]; // await getUserList();
+  let usernameArray = await getUserList();
   if (usernameArray.length === 0) {
     usernameArray.push("santoshbhagat"); // fallback
   }
