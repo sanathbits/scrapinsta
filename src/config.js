@@ -1,4 +1,4 @@
-const backendBaseUrl = process.env.BACKEND_BASE_URL || "https://uat-viralx.enpointe.io";
+const backendBaseUrl = process.env.BACKEND_BASE_URL || "http://localhost:3001" || "https://api-viralx.enpointe.io";
 
 const config = {
   backendBaseUrl: backendBaseUrl.replace(/\/$/, ""),

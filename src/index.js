@@ -888,7 +888,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     }
   }
 
-  const usernameArray = await getUserList();
+  let usernameArray = ["orellryan"]; // await getUserList();
   if (usernameArray.length === 0) {
     usernameArray.push("santoshbhagat"); // fallback
   }
@@ -959,54 +959,65 @@ async function convertMP4toMP3() {
     const finalOutputPath = (inputPath === outputPath) ? `${outputPath}.mp3` : outputPath;
 
     try {
-      console.log("Running ffmpeg for:", inputPath, "->", finalOutputPath);
-      await execAsync(
-        `"${ffmpegPath}" -y -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${finalOutputPath}"`
-      );
+      let hasAudio = false;
+      try {
+        const { stdout: probeOut } = await execAsync(
+          `"${ffmpegPath}" -i "${inputPath}" -hide_banner 2>&1`
+        ).catch(e => ({ stdout: e.stderr || e.stdout || "" }));
+        hasAudio = /Stream.*Audio/.test(probeOut);
+      } catch {
+        hasAudio = false;
+      }
 
-      entry.mp3FilePath = finalOutputPath;
+      if (hasAudio) {
+        console.log("Running ffmpeg for:", inputPath, "->", finalOutputPath);
+        await execAsync(
+          `"${ffmpegPath}" -y -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${finalOutputPath}"`
+        );
+        entry.mp3FilePath = finalOutputPath;
+        let serverMP3Url = await uploadFileToServer(finalOutputPath);
+        entry.serverMP3Url = serverMP3Url;
+        console.log("MP3 created:", finalOutputPath);
+      } else {
+        console.log("No audio stream in", inputPath, "- skipping MP3 conversion");
+      }
 
       let serverMP4Url = await uploadFileToServer(inputPath);
-      let serverMP3Url = await uploadFileToServer(finalOutputPath);
-
       entry.serverMP4Url = serverMP4Url;
-      entry.serverMP3Url = serverMP3Url;
 
       if (entry.thumbnailUrl) {
         const uploadedThumb = await uploadImageFromUrlToServer(entry.thumbnailUrl);
         if (uploadedThumb) entry.thumbnailUrl = uploadedThumb;
       }
 
-      // Map stats from allProfiles.json
-      try {
-        const rawProfiles = await fs.readFile(ALL_PROFILES_PATH, "utf8");
-        const profiles = JSON.parse(rawProfiles);
-        const profileList = Array.isArray(profiles) ? profiles : [profiles];
-
-        for (const p of profileList) {
-          if (p.links && Array.isArray(p.links)) {
-            // Find the link object where the href matches the entry's linkUrl
-            // entry.linkUrl is absolute, link.href is relative
-            const statObj = p.links.find((l) => entry.linkUrl && entry.linkUrl.includes(l.href));
-            if (statObj) {
-              entry.likes = statObj.likes;
-              entry.views = statObj.views;
-              entry.comments = statObj.comments;
-              console.log(`Mapped stats for ${entry.linkUrl}: Likes=${entry.likes}, Views=${entry.views}, Comments=${entry.comments}`);
-              break;
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("Failed to map stats from allProfiles.json:", err.message);
-      }
-
       entry.isConverted = true;
       changed = true;
-      console.log("MP3 created:", outputPath);
     } catch (err) {
       console.error("ffmpeg conversion failed for", inputPath, ":", err.message);
     }
+  }
+
+  try {
+    const rawProfiles = await fs.readFile(ALL_PROFILES_PATH, "utf8");
+    const profiles = JSON.parse(rawProfiles);
+    const profileList = Array.isArray(profiles) ? profiles : [profiles];
+
+    for (const entry of reels) {
+      for (const p of profileList) {
+        if (p.links && Array.isArray(p.links)) {
+          const statObj = p.links.find((l) => entry.linkUrl && entry.linkUrl.includes(l.href));
+          if (statObj) {
+            if (statObj.views) entry.views = statObj.views;
+            if (statObj.likes) entry.likes = statObj.likes;
+            if (statObj.comments) entry.comments = statObj.comments;
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Failed to map stats from allProfiles.json:", err.message);
   }
 
   if (changed) {
@@ -1014,7 +1025,7 @@ async function convertMP4toMP3() {
     await updateUserProfiles();
     await updateContentReels();
     userDataRetrival = false;
-    console.log("Allreel.json updated with MP3 paths.");
+    console.log("Allreel.json updated.");
   } else {
     console.log("No MP4 entries required conversion.");
   }
@@ -1185,6 +1196,7 @@ async function updateContentReels() {
       caption_text: entry.caption ?? "",
       video_url: entry.serverMP4Url,
       thumbnail_url: entry.thumbnailUrl ?? "",
+      audio_url: entry.serverMP3Url ?? null,
       video_duration: 0,
       has_audio: true,
       repost_count: entry.repostCount ?? 0,
@@ -1618,7 +1630,7 @@ let googleKeepAliveCount = 16;
 
 console.log("userDataCount", userDataCount, "googleKeepAliveCount", googleKeepAliveCount);
 
-let targetUserDataCount = 120;
+let targetUserDataCount = 3;
 let targetGoogleKeepAliveCount = 15;
 
 let userDataRetrival = false
