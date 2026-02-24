@@ -4,16 +4,14 @@ import process from "node:process";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import puppeteer from "puppeteer";
-import dotenv from "dotenv";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import { Worker } from "bullmq";
+import IORedis from "ioredis";
 import config from "./config.js";
 
 const ffmpegPath = ffmpegInstaller.path;
 
 const execAsync = promisify(exec);
-
-dotenv.config();
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const MINUTE_MS = 60_000;
@@ -21,14 +19,17 @@ const HOUR_MS = 60 * MINUTE_MS;
 
 const ALL_REEL_PATH = path.resolve(process.cwd(), "output", "Allreel.json");
 const ALL_PROFILES_PATH = path.resolve(process.cwd(), "output", "allProfiles.json");
-const DOWNLOAD_DIR = path.join(process.env.HOME || process.cwd(), "Downloads");
+const DOWNLOAD_DIR = config.downloadDir || path.join(process.cwd(), "Downloads");
 
 const INSTA_USER_LIST_API_URL = config.instaUserListApiUrl;
-const INSTA_USER_LIST_TOKEN = process.env.INSTA_USER_LIST_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXJ2aWNlIjoiZXh0ZXJuYWwtc2VydmljZSIsImlhdCI6MTc2OTUyMzIzOSwiZXhwIjoxNzcyMTE1MjM5fQ.8UOhvJ-QBbsrod_gn-h0Z0uHz86MvDXBe4LIPeCTv1A";
+const INSTA_USER_LIST_TOKEN = config.instaUserListToken;
 const UPLOAD_MEDIA_API_URL = config.uploadMediaApiUrl;
 const UPDATE_PROFILE_BASE_URL = config.updateProfileBaseUrl;
 const UPDATE_POSTS_BASE_URL = config.updatePostsBaseUrl;
-
+const GET_FAILED_MEDIA_CODES_API_URL = config.getFailedMediaCodesApiUrl;
+const BATCH_SYNC_RETRIED_MEDIA_URL = config.batchSyncRetriedMediaApiUrl;
+const BATCH_UPDATE_VIDEO_URLS_API_URL = config.batchUpdateVideoUrlsApiUrl;
+const REDIS_URL = config.redisUrl || "redis://localhost:6379";
 
 async function loadAllReels() {
   try {
@@ -36,7 +37,6 @@ async function loadAllReels() {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
-    // File missing or invalid JSON – start fresh.
     return [];
   }
 }
@@ -73,16 +73,30 @@ async function getLatestDownloadedFile() {
     const files = await fs.readdir(DOWNLOAD_DIR);
     if (!files.length) return null;
 
-    let latest = null;
+    let newestFile = null;
+    let newestTime = 0;
+
     for (const name of files) {
       const fullPath = path.join(DOWNLOAD_DIR, name);
       const stat = await fs.stat(fullPath).catch(() => null);
       if (!stat || !stat.isFile()) continue;
-      if (!latest || stat.mtimeMs > latest.mtimeMs) {
-        latest = { fileName: name, filePath: fullPath, mtimeMs: stat.mtimeMs, isConverted: false };
+
+      if (stat.mtimeMs > newestTime) {
+        newestTime = stat.mtimeMs;
+        newestFile = name;
       }
     }
-    return latest;
+
+    if (!newestFile) return null;
+    const isPartial = newestFile.endsWith(".crdownload") || newestFile.endsWith(".part") || newestFile.endsWith(".tmp");
+
+    return {
+      fileName: newestFile,
+      filePath: path.join(DOWNLOAD_DIR, newestFile),
+      mtimeMs: newestTime,
+      isConverted: false,
+      isPartial
+    };
   } catch {
     return null;
   }
@@ -98,7 +112,7 @@ async function dirHasFiles(dir) {
 }
 
 function resolveProfileDir() {
-  const raw = process.env.PROFILE_DIR || "./chrome-profile";
+  const raw = config.profileDir || "./chrome-profile";
   return path.resolve(process.cwd(), raw);
 }
 
@@ -127,8 +141,6 @@ function normalizeCount(raw) {
 }
 
 function parseProfileStatsFromHtml(html) {
-  // Best source: <meta name="description" content="... X Followers, Y Following, Z Posts ...">
-  // Instagram varies locale/format, so we match case-insensitive keyword chunks.
   const meta = html.match(
     /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["'][^>]*>/i
   );
@@ -144,7 +156,6 @@ function parseProfileStatsFromHtml(html) {
   const followingRaw = find("following");
   const postsRaw = find("posts?");
 
-  // Profile picture: <img alt="username's profile picture" ... src="https://...">
   let profilePicUrl = null;
   const imgWithAlt = html.match(
     /<img[^>]*?\salt="[^"]*profile picture[^"]*"[^>]*?\ssrc="([^"]+)"[^>]*>/i
@@ -169,14 +180,6 @@ function parseProfileStatsFromHtml(html) {
   };
 }
 
-/**
- * Extracts profile stats (and profile picture URL) from page/html, optionally downloads the profile image to outDir.
- * @param {import('puppeteer').Page} page
- * @param {string} html
- * @param {string} [username] - Used for saving profile image as profile-{username}.jpg and for DOM fallback
- * @param {string} [outDir] - Folder to save downloaded profile picture (e.g. output/2026-01-29_17-52-58)
- * @returns {Promise<{ profilePicUrl?: string, profilePicLocalPath?: string, ... }>}
- */
 async function extractProfileStats(page, html, username, outDir) {
   const fromHtml = parseProfileStatsFromHtml(html);
   let profilePicUrl = fromHtml.profilePicUrl;
@@ -222,7 +225,6 @@ async function extractProfileStats(page, html, username, outDir) {
     return fromHtml;
   }
 
-  // Fallback: parse visible text from the rendered DOM.
   const fromText = await page
     .evaluate(() => {
       const headerText =
@@ -259,8 +261,6 @@ async function extractProfileStats(page, html, username, outDir) {
 }
 
 async function safeScreenshot(page, filePath, fullPage = true) {
-  // Some Puppeteer builds can transiently report 0x0 layout early in navigation.
-  // This helper retries briefly and never fails the whole run.
   for (let i = 0; i < 5; i++) {
     try {
       const dims = await page
@@ -274,13 +274,11 @@ async function safeScreenshot(page, filePath, fullPage = true) {
         return true;
       }
     } catch {
-      // retry
     }
     await sleep(250);
   }
 
   try {
-    // Last attempt anyway; if it fails, swallow.
     await page.screenshot({ path: filePath, fullPage });
     return true;
   } catch (e) {
@@ -291,15 +289,9 @@ async function safeScreenshot(page, filePath, fullPage = true) {
   }
 }
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
-}
-
 function getArgUrl() {
   const arg = process.argv.slice(2).find((x) => x && !x.startsWith("-"));
-  return arg || process.env.TARGET_URL || "https://www.instagram.com/";
+  return arg || config.targetUrl || "https://www.instagram.com/";
 }
 
 function tsDirName() {
@@ -311,8 +303,6 @@ function tsDirName() {
 }
 
 async function clickButtonByExactText(page, text, timeoutMs = 2000) {
-  // Avoid Puppeteer XPath helpers ($x) since they're not available in some versions/builds.
-  // Best-effort: find a clickable element whose visible textContent matches exactly and click it.
   const clicked = await page
     .waitForFunction(
       (t) => {
@@ -334,7 +324,6 @@ async function clickButtonByExactText(page, text, timeoutMs = 2000) {
 }
 
 async function handleCommonInstagramPostLoginDialogs(page) {
-  // These dialogs vary by locale/account. Best-effort.
   await clickButtonByExactText(page, "Not Now").catch(() => { });
   await clickButtonByExactText(page, "Not now").catch(() => { });
 }
@@ -382,10 +371,6 @@ async function waitForManualLogin(page, timeoutMs = 10 * 60 * 1000) {
 }
 
 async function waitForInstagramLoggedIn(page) {
-  // Don't rely only on URL (e.g. /?flo=true). Wait for UI change:
-  // - login form disappears OR
-  // - logged-in nav UI appears OR
-  // - we land on a challenge/2FA page.
   await page.waitForFunction(
     () => {
       const href = location.href;
@@ -425,7 +410,7 @@ async function loginInstagram(page, username, password, outDir) {
   ).catch(() => { });
   await clickButtonByExactText(page, "Accept all", 1500).catch(() => { });
 
-  if (process.env.DEBUG_LOGIN === "1") {
+  if (config.debugLogin === "1") {
     await safeScreenshot(page, path.join(outDir, "login-01-loaded.png"), true);
   }
 
@@ -437,7 +422,7 @@ async function loginInstagram(page, username, password, outDir) {
   await page.click('input[name="password"]', { clickCount: 3 });
   await page.type('input[name="password"]', password, { delay: 20 });
 
-  if (process.env.DEBUG_LOGIN === "1") {
+  if (config.debugLogin === "1") {
     await safeScreenshot(page, path.join(outDir, "login-02-filled.png"), true);
   }
 
@@ -462,7 +447,7 @@ async function loginInstagram(page, username, password, outDir) {
   // If a checkpoint/2FA/captcha appears, this will likely stall; run with HEADFUL=1 to complete manually.
   await waitForInstagramLoggedIn(page);
 
-  if (process.env.DEBUG_LOGIN === "1") {
+  if (config.debugLogin === "1") {
     await safeScreenshot(
       page,
       path.join(outDir, "login-03-after-submit.png"),
@@ -888,9 +873,10 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     }
   }
 
-  let usernameArray = await getUserList();
+  // let usernameArray = await getUserList();
+  let usernameArray = ["mai.chaman"];
   if (usernameArray.length === 0) {
-    usernameArray.push("santoshbhagat"); // fallback
+    usernameArray.push("mai.chaman"); // fallback
   }
 
   const combined = [];
@@ -1239,15 +1225,13 @@ async function runScheduled() {
   const profileDir = resolveProfileDir();
   await fs.mkdir(profileDir, { recursive: true });
   const firstRun = !(await dirHasFiles(profileDir));
-  const headful = process.env.HEADFUL === "1" || firstRun;
+  const headful = config.headful === "1" || firstRun;
 
   const browser = await launchBrowser({ headful, profileDir });
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 720 });
 
-  const keepAliveEveryMsRaw = Number(
-    process.env.KEEPALIVE_EVERY_MS || 15 * MINUTE_MS
-  );
+  const keepAliveEveryMsRaw = Number(15 * MINUTE_MS);
   const runEveryMsRaw = Number(process.env.RUN_EVERY_MS || HOUR_MS);
   const keepAliveEveryMs = Number.isFinite(keepAliveEveryMsRaw)
     ? keepAliveEveryMsRaw
@@ -1365,7 +1349,7 @@ async function scrapeReelMetadataFromPage(tab) {
             }
             break;
           }
-        } catch (e) {}
+        } catch (e) { }
       }
       const ogImage = document.querySelector('meta[property="og:image"]');
       if (ogImage && ogImage.getAttribute("content")) {
@@ -1384,7 +1368,8 @@ async function scrapeReelMetadataFromPage(tab) {
     }));
 }
 
-async function processLinkInTab(browser, linkUrl, outDir) {
+async function processLinkInTab(browser, linkUrl, outDir, options = {}) {
+  const skipInstagram = options.skipInstagram || false;
   const existingList = await loadAllReels();
   if (existingList.some((e) => e.linkUrl === linkUrl && e.downloaded)) {
     console.log("Skipping already processed reel:", linkUrl);
@@ -1399,38 +1384,42 @@ async function processLinkInTab(browser, linkUrl, outDir) {
   await tab.setViewport({ width: 1280, height: 720 });
 
   try {
-    const reelPageUrl = getReelPageUrl(linkUrl);
-    if (reelPageUrl) {
-      console.log("Opening reel page:", reelPageUrl);
-      await tab.goto(reelPageUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 60_000,
-      });
-      await tab.waitForSelector("main", { timeout: 15_000 }).catch(() => null);
-      await sleep(3000);
-      if (outDir) {
-        const parts = new URL(reelPageUrl).pathname.split("/").filter(Boolean);
-        const reelId = (parts[parts.length - 1] || parts[2] || "reel").replace(/[^a-zA-Z0-9_-]/g, "");
-        const reelHtmlPath = path.join(outDir, `reel-${reelId}.html`);
-        await fs.mkdir(outDir, { recursive: true });
-        const html = await tab.content();
-        await fs.writeFile(reelHtmlPath, html, "utf8");
-        console.log("Saved reel page HTML:", reelHtmlPath);
-      }
-      const meta = await scrapeReelMetadataFromPage(tab);
-      await upsertReelEntry(linkUrl, (e) => {
-        if (meta.caption != null) e.caption = meta.caption;
-        if (meta.thumbnailUrl != null) e.thumbnailUrl = meta.thumbnailUrl;
-        if (meta.likeCount != null) e.likes = String(meta.likeCount);
-        if (meta.commentCount != null) e.comments = String(meta.commentCount);
-        if (meta.viewCount != null) e.views = String(meta.viewCount);
-        if (meta.repostCount != null) {
-          e.repostCount = meta.repostCount;
-          e.reshareCount = meta.reshareCount != null ? meta.reshareCount : meta.repostCount;
+    if (!skipInstagram) {
+      const reelPageUrl = getReelPageUrl(linkUrl);
+      if (reelPageUrl) {
+        console.log("Opening reel page:", reelPageUrl);
+        await tab.goto(reelPageUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await tab.waitForSelector("main", { timeout: 15_000 }).catch(() => null);
+        await sleep(3000);
+        if (outDir) {
+          const parts = new URL(reelPageUrl).pathname.split("/").filter(Boolean);
+          const reelId = (parts[parts.length - 1] || parts[2] || "reel").replace(/[^a-zA-Z0-9_-]/g, "");
+          const reelHtmlPath = path.join(outDir, `reel-${reelId}.html`);
+          await fs.mkdir(outDir, { recursive: true });
+          const html = await tab.content();
+          await fs.writeFile(reelHtmlPath, html, "utf8");
+          console.log("Saved reel page HTML:", reelHtmlPath);
         }
-      });
+        const meta = await scrapeReelMetadataFromPage(tab);
+        await upsertReelEntry(linkUrl, (e) => {
+          if (meta.caption != null) e.caption = meta.caption;
+          if (meta.thumbnailUrl != null) e.thumbnailUrl = meta.thumbnailUrl;
+          if (meta.likeCount != null) e.likes = String(meta.likeCount);
+          if (meta.commentCount != null) e.comments = String(meta.commentCount);
+          if (meta.viewCount != null) e.views = String(meta.viewCount);
+          if (meta.repostCount != null) {
+            e.repostCount = meta.repostCount;
+            e.reshareCount = meta.reshareCount != null ? meta.reshareCount : meta.repostCount;
+          }
+        });
+      } else {
+        console.warn("Could not build reel page URL for:", linkUrl);
+      }
     } else {
-      console.warn("Could not build reel page URL for:", linkUrl);
+      console.log("Skipping Instagram page as requested.");
     }
 
     console.log("Opening fastvideosave for:", linkUrl);
@@ -1459,11 +1448,24 @@ async function processLinkInTab(browser, linkUrl, outDir) {
     });
 
     if (clicked) {
-      await sleep(3000);
+      console.log("Download clicked, waiting for file...");
+      await sleep(5000);
 
-      // Try to detect the latest file in the Downloads folder
-      const latest = await getLatestDownloadedFile();
-      if (latest) {
+      // Try to detect the latest file in the Downloads folder, waiting if partial
+      let latest = null;
+      for (let attempt = 0; attempt < 24; attempt++) {
+        latest = await getLatestDownloadedFile();
+        if (latest && !latest.isPartial) break;
+
+        if (latest && latest.isPartial) {
+          console.log(`Download in progress: ${latest.fileName}...`);
+        } else {
+          console.log("Waiting for file to appear...");
+        }
+        await sleep(5000);
+      }
+
+      if (latest && !latest.isPartial) {
         console.log(
           "Latest downloaded file for",
           linkUrl,
@@ -1493,7 +1495,210 @@ async function processLinkInTab(browser, linkUrl, outDir) {
     await tab.close().catch(() => { });
   }
   // Do not close immediately if downloads are needed
-  // await tab.close().catch(() => {});
+  await tab.close().catch(() => { });
+}
+
+async function getFailedMediaCodes() {
+  if (!INSTA_USER_LIST_TOKEN) {
+    console.warn("INSTA_USER_LIST_TOKEN not set; returning empty list.");
+    return [];
+  }
+  try {
+    const res = await fetch(GET_FAILED_MEDIA_CODES_API_URL, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+      },
+    });
+    if (!res.ok) {
+      throw new Error(`getFailedMediaCodes failed: ${res.status} ${res.statusText}`);
+    }
+    const body = await res.json();
+    if (!body.success || !Array.isArray(body.data)) {
+      throw new Error(body.message || "Invalid response: expected success and data array");
+    }
+    return body.data;
+  } catch (err) {
+    console.log("Error fetching failed media codes:", err, GET_FAILED_MEDIA_CODES_API_URL);
+    console.error("Error fetching failed media codes:", err.message);
+    return [];
+  }
+}
+
+export async function runGarbageCollector() {
+  console.log("♻️  Starting Garbage Collector - retrying failed media via Website (Puppeteer)...");
+
+  let localBrowser = false;
+  if (!browser) {
+    console.log("🚀 Initializing browser for garbage collector...");
+    const profileDir = path.resolve(process.cwd(), "chrome-profile-retry");
+    await fs.mkdir(profileDir, { recursive: true });
+    browser = await launchBrowser({
+      headful: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+      ],
+      profileDir,
+      retries: 3
+    });
+    localBrowser = true;
+  }
+
+  const failedItems = await getFailedMediaCodes();
+  console.log(`📊 Found ${failedItems.length} failed media items from backend.`);
+
+  if (failedItems.length === 0) {
+    console.log("✅ No failed media to process.");
+    return;
+  }
+
+  const runId = tsDirName();
+  const baseDir = path.resolve(process.cwd(), "output", "garbage-collector-" + runId);
+  await fs.mkdir(baseDir, { recursive: true });
+
+  const mapping = {};
+
+  for (const item of failedItems) {
+    const { code } = item;
+    const linkUrl = `https://www.instagram.com/reel/${code}/`;
+    console.log(`🔄 Processing code via website: ${code}`);
+
+    mapping[code] = {
+      status: 'failed',
+      linkUrl
+    };
+
+    try {
+      // processLinkInTab handles the website interaction and download
+      await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
+
+      // After processing, check the state for the filePath
+      const list = await loadAllReels();
+      const entry = list.find(e => e.linkUrl === linkUrl);
+
+      if (entry && entry.downloaded && entry.filePath) {
+        console.log(`✅ Successfully processed ${code} via website. File: ${entry.filePath}`);
+        mapping[code].video_url = entry.filePath;
+        mapping[code].status = 'success';
+      } else {
+        console.warn(`⚠️  Website processing finished but no file detected for ${code}`);
+      }
+    } catch (err) {
+      console.error(`❌ Failed to process ${code} via website:`, err.message);
+      mapping[code].error = err.message;
+    }
+  }
+
+  const mappingPath = path.join(baseDir, "mapping.json");
+  await fs.writeFile(mappingPath, JSON.stringify(mapping, null, 2), "utf8");
+  console.log(`📄 Created initial mapping.json at: ${mappingPath}`);
+
+  // Now, for each success item, upload to server and sync back
+  console.log("📤 Syncing results back to backend in batch...");
+
+  const updateMap = {};
+
+  for (const code of Object.keys(mapping)) {
+    const entry = mapping[code];
+    if (entry.status !== 'success') continue;
+
+    if (entry.video_url) {
+      const serverVideoUrl = await uploadFileToServer(entry.video_url);
+
+      if (serverVideoUrl) {
+        mapping[code].server_video_url = serverVideoUrl;
+
+        // Convert to MP3 and upload
+        let serverAudioUrl = null;
+        try {
+          const inputPath = entry.video_url;
+          const outputPath = inputPath.replace(/\.[^/.]+$/, "") + ".mp3";
+
+          console.log(`🎵 Converting for Garbage Collector: ${inputPath} -> ${outputPath}`);
+          await execAsync(
+            `"${ffmpegPath}" -y -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${outputPath}"`
+          );
+
+          if (await fs.access(outputPath).then(() => true).catch(() => false)) {
+            serverAudioUrl = await uploadFileToServer(outputPath);
+            if (serverAudioUrl) {
+              mapping[code].server_audio_url = serverAudioUrl;
+            }
+          }
+        } catch (err) {
+          console.warn(`⚠️ Failed to generate/upload audio for ${code}: ${err.message}`);
+        }
+
+        updateMap[code] = {
+          video_url: serverVideoUrl,
+          audio_url: serverAudioUrl
+        };
+      }
+    }
+  }
+
+  // Update mapping.json with server URLs
+  await fs.writeFile(mappingPath, JSON.stringify(mapping, null, 2), "utf8");
+  console.log(`📄 Updated mapping.json with server URLs at: ${mappingPath}`);
+
+  if (Object.keys(updateMap).length > 0) {
+    try {
+      console.log(`📤 Syncing ${Object.keys(updateMap).length} video URLs to backend...`);
+      const res = await fetch(BATCH_UPDATE_VIDEO_URLS_API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(updateMap),
+      });
+      if (!res.ok) {
+        throw new Error(`Batch update video URLs failed: ${res.status} ${res.statusText}`);
+      }
+      const syncResult = await res.json();
+      console.log(`✅ Batch update video URLs completed:`, JSON.stringify(syncResult));
+    } catch (err) {
+      console.error(`❌ Failed to sync batch video URLs:`, err.message);
+    }
+  } else {
+    console.log("ℹ️ No successfully processed video URLs to sync.");
+  }
+
+  console.log("✅ Garbage Collector run finished.");
+
+  if (localBrowser && browser) {
+    console.log("🛑 Closing local browser...");
+    await browser.close();
+    browser = null;
+  }
+}
+
+function initBullMQWorker() {
+  console.log(`🔌 Initializing BullMQ Worker on Redis: ${REDIS_URL}`);
+
+  const connection = new IORedis(REDIS_URL, {
+    maxRetriesPerRequest: null,
+  });
+
+  const worker = new Worker('failed-media-retry', async job => {
+    console.log(`📥 Received BullMQ job: ${job.name}`, job.data);
+    if (job.name === 'retry-failed-media') {
+      await runGarbageCollector();
+    }
+  }, { connection });
+
+  worker.on('completed', job => {
+    console.log(`✅ Job ${job.id} completed!`);
+  });
+
+  worker.on('failed', (job, err) => {
+    console.error(`❌ Job ${job?.id} failed:`, err.message);
+  });
+
+  console.log("🚀 BullMQ Worker listening for jobs in 'failed-media-retry' queue");
 }
 
 
@@ -1578,6 +1783,10 @@ async function main() {
     const testPage = await browser.newPage();
     await testPage.close();
     console.log("✅ Browser connection verified");
+
+    // Initialize BullMQ Worker
+    initBullMQWorker();
+
   } catch (error) {
     console.error("❌ Failed to launch browser after retries:", error.message);
     console.error("\n🔧 Troubleshooting steps:");

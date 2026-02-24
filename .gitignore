@@ -2,6 +2,7 @@
 node_modules/
 output/
 chrome-profile/
+chrome-profile-retry/
 .DS_Store
 
 src/extensions/

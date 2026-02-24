@@ -5,12 +5,15 @@
   "description": "Log into Instagram, navigate to a URL, and save screenshot + HTML + CSS dump.",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "retry": "node src/trigger.js"
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "bullmq": "^5.70.1",
     "dotenv": "^16.4.5",
     "ffmpeg": "^0.0.4",
+    "ioredis": "^5.9.3",
     "puppeteer": "^23.11.1"
   }
 }
