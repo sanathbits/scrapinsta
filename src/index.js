@@ -873,8 +873,8 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     }
   }
 
-  // let usernameArray = await getUserList();
-  let usernameArray = ["mai.chaman"];
+  let usernameArray = await getUserList();
+  // let usernameArray = ["mai.chaman"];
   if (usernameArray.length === 0) {
     usernameArray.push("mai.chaman"); // fallback
   }
@@ -1100,6 +1100,150 @@ async function uploadImageFromUrlToServer(imageUrl) {
     return url;
   } catch (err) {
     console.error("Upload image from URL error:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Downloads the thumbnail of an Instagram post via toolzin.com.
+ * Opens toolzin.com/tools/instagram-downloader/, pastes the URL,
+ * clicks "Download Now", waits for results, and extracts the "Save Thumbnail" link.
+ *
+ * @param {import('puppeteer').Browser} browser - Puppeteer browser instance
+ * @param {string} linkUrl - Instagram post/reel URL (e.g. https://www.instagram.com/reel/CndIoLBLxmj/)
+ * @returns {Promise<string|null>} The thumbnail image URL, or null on failure
+ */
+async function downloadThumbnailFromToolzin(browser, linkUrl) {
+  const tab = await browser.newPage();
+  await tab.setViewport({ width: 1280, height: 720 });
+
+  try {
+    console.log("[Thumbnail] Opening toolzin.com for:", linkUrl);
+    await tab.goto("https://toolzin.com/tools/instagram-downloader/", {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+
+    // Wait for the URL input field
+    await tab.waitForSelector("input#url", { timeout: 30_000 });
+
+    // Click the thumbnail tab to ensure thumbnail mode is active
+    const thumbTabClicked = await tab.evaluate(() => {
+      const thumbTab = document.querySelector("#nav-thumbnail-tab");
+      if (thumbTab) { thumbTab.click(); return true; }
+      return false;
+    });
+    if (thumbTabClicked) {
+      console.log("[Thumbnail] Thumbnail tab clicked.");
+      await sleep(1000);
+    }
+
+    // Clear and type the Instagram URL
+    await tab.click("input#url", { clickCount: 3 });
+    await tab.type("input#url", linkUrl, { delay: 30 });
+
+    // Click the "Download Now" button
+    await tab.click("button#btn_submit");
+    console.log("[Thumbnail] 'Download Now' clicked, waiting for results...");
+
+    // Poll until the button text changes back to "Download Now" (from "Wait a moment...")
+    const MAX_POLL_ATTEMPTS = 30; // ~60 seconds max
+    for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
+      await sleep(2000);
+      const btnText = await tab.evaluate(() => {
+        const btn = document.querySelector("button#btn_submit");
+        return btn ? btn.textContent.trim() : "";
+      });
+      if (btnText.toLowerCase().includes("download now") && i > 0) {
+        console.log("[Thumbnail] Results loaded.");
+        break;
+      }
+      if (i === MAX_POLL_ATTEMPTS - 1) {
+        console.warn("[Thumbnail] Timed out waiting for results.");
+        return null;
+      }
+    }
+
+    // Wait a bit for the results DOM to fully render
+    await sleep(2000);
+
+    // Extract the "Save Thumbnail" link from #ajax_result
+    let thumbnailUrl = await tab.evaluate(() => {
+      const resultContainer = document.querySelector("#ajax_result");
+      if (!resultContainer) return null;
+      const anchors = resultContainer.querySelectorAll("a");
+      for (const a of anchors) {
+        const text = (a.textContent || "").toLowerCase();
+        if (text.includes("save thumbnail") || text.includes("download thumbnail")) {
+          return a.href || a.getAttribute("href") || null;
+        }
+      }
+      // Fallback: look for any image in the result
+      const img = resultContainer.querySelector("img.post-image");
+      if (img && img.src && !img.src.startsWith("data:")) return img.src;
+      return null;
+    });
+
+    if (thumbnailUrl && thumbnailUrl.includes("toolzin.com/download")) {
+      try {
+        const urlObj = new URL(thumbnailUrl);
+        const encodedFile = urlObj.searchParams.get("file");
+        if (encodedFile) {
+          // Toolzin encodes IG URLs in base64 and replaces chars
+          let decoded = Buffer.from(encodedFile, "base64").toString("utf-8");
+          // Based on Toolzin's pattern: *$^ -> =, ^$* -> &
+          decoded = decoded.replaceAll("*$^", "=").replaceAll("^$*", "&");
+          if (decoded.startsWith("http")) {
+            console.log("[Thumbnail] Decoded Toolzin redirect to direct URL:", decoded);
+            thumbnailUrl = decoded;
+          }
+        }
+      } catch (decodeErr) {
+        console.warn("[Thumbnail] Failed to decode Toolzin download link:", decodeErr.message);
+      }
+    }
+
+    if (thumbnailUrl) {
+      console.log("[Thumbnail] Final thumbnail URL:", thumbnailUrl);
+    } else {
+      console.warn("[Thumbnail] No 'Save Thumbnail' link found in results.");
+    }
+
+    return thumbnailUrl;
+  } catch (err) {
+    console.error("[Thumbnail] Error:", err.message);
+    return null;
+  } finally {
+    await tab.close().catch(() => { });
+  }
+}
+
+/**
+ * Downloads thumbnail from toolzin.com and uploads it to the cloud.
+ * This is a separate flow that can be called independently.
+ *
+ * @param {import('puppeteer').Browser} browser - Puppeteer browser instance
+ * @param {string} linkUrl - Instagram post/reel URL
+ * @returns {Promise<{thumbnailUrl: string, uploadedUrl: string}|null>} URLs or null on failure
+ */
+async function downloadAndUploadThumbnail(browser, linkUrl) {
+  try {
+    const thumbnailUrl = await downloadThumbnailFromToolzin(browser, linkUrl);
+    if (!thumbnailUrl) {
+      console.warn("[Thumbnail] Could not extract thumbnail for:", linkUrl);
+      return null;
+    }
+
+    const uploadedUrl = await uploadImageFromUrlToServer(thumbnailUrl);
+    if (!uploadedUrl) {
+      console.warn("[Thumbnail] Failed to upload thumbnail to cloud for:", linkUrl);
+      return { thumbnailUrl, uploadedUrl: null };
+    }
+
+    console.log("[Thumbnail] Pipeline complete:", linkUrl, "->", uploadedUrl);
+    return { thumbnailUrl, uploadedUrl };
+  } catch (err) {
+    console.error("[Thumbnail] downloadAndUploadThumbnail error:", err.message);
     return null;
   }
 }
@@ -1500,8 +1644,8 @@ async function processLinkInTab(browser, linkUrl, outDir, options = {}) {
 
 async function getFailedMediaCodes() {
   if (!INSTA_USER_LIST_TOKEN) {
-    console.warn("INSTA_USER_LIST_TOKEN not set; returning empty list.");
-    return [];
+    console.warn("INSTA_USER_LIST_TOKEN not set; returning empty object.");
+    return {};
   }
   try {
     const res = await fetch(GET_FAILED_MEDIA_CODES_API_URL, {
@@ -1514,19 +1658,19 @@ async function getFailedMediaCodes() {
       throw new Error(`getFailedMediaCodes failed: ${res.status} ${res.statusText}`);
     }
     const body = await res.json();
-    if (!body.success || !Array.isArray(body.data)) {
-      throw new Error(body.message || "Invalid response: expected success and data array");
+    if (!body.success || !body.data) {
+      throw new Error(body.message || "Invalid response: expected success and data object");
     }
-    return body.data;
+    return body.data; // { videos: [], audios: [], thumbnails: [], both: [] }
   } catch (err) {
-    console.log("Error fetching failed media codes:", err, GET_FAILED_MEDIA_CODES_API_URL);
     console.error("Error fetching failed media codes:", err.message);
-    return [];
+    return {};
   }
 }
 
-export async function runGarbageCollector() {
-  console.log("♻️  Starting Garbage Collector - retrying failed media via Website (Puppeteer)...");
+export async function runGarbageCollector(options = {}) {
+  const { video = true, audio = true, thumbnail = true } = options;
+  console.log(`♻️  Starting Garbage Collector - video:${video}, audio:${audio}, thumbnail:${thumbnail}`);
 
   let localBrowser = false;
   if (!browser) {
@@ -1547,10 +1691,13 @@ export async function runGarbageCollector() {
     localBrowser = true;
   }
 
-  const failedItems = await getFailedMediaCodes();
-  console.log(`📊 Found ${failedItems.length} failed media items from backend.`);
+  const failedData = await getFailedMediaCodes();
+  const { videos: failedVideos = [], audios: failedAudios = [], thumbnails: failedThumbnails = [], both: failedBoth = [] } = failedData;
 
-  if (failedItems.length === 0) {
+  const total = failedVideos.length + failedAudios.length + failedThumbnails.length + failedBoth.length;
+  console.log(`📊 Found ${total} failed media items (${failedVideos.length}V, ${failedAudios.length}A, ${failedThumbnails.length}T, ${failedBoth.length}B).`);
+
+  if (total === 0) {
     console.log("✅ No failed media to process.");
     return;
   }
@@ -1560,93 +1707,141 @@ export async function runGarbageCollector() {
   await fs.mkdir(baseDir, { recursive: true });
 
   const mapping = {};
-
-  for (const item of failedItems) {
-    const { code } = item;
-    const linkUrl = `https://www.instagram.com/reel/${code}/`;
-    console.log(`🔄 Processing code via website: ${code}`);
-
-    mapping[code] = {
-      status: 'failed',
-      linkUrl
-    };
-
-    try {
-      // processLinkInTab handles the website interaction and download
-      await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
-
-      // After processing, check the state for the filePath
-      const list = await loadAllReels();
-      const entry = list.find(e => e.linkUrl === linkUrl);
-
-      if (entry && entry.downloaded && entry.filePath) {
-        console.log(`✅ Successfully processed ${code} via website. File: ${entry.filePath}`);
-        mapping[code].video_url = entry.filePath;
-        mapping[code].status = 'success';
-      } else {
-        console.warn(`⚠️  Website processing finished but no file detected for ${code}`);
-      }
-    } catch (err) {
-      console.error(`❌ Failed to process ${code} via website:`, err.message);
-      mapping[code].error = err.message;
-    }
-  }
-
-  const mappingPath = path.join(baseDir, "mapping.json");
-  await fs.writeFile(mappingPath, JSON.stringify(mapping, null, 2), "utf8");
-  console.log(`📄 Created initial mapping.json at: ${mappingPath}`);
-
-  // Now, for each success item, upload to server and sync back
-  console.log("📤 Syncing results back to backend in batch...");
-
   const updateMap = {};
 
-  for (const code of Object.keys(mapping)) {
-    const entry = mapping[code];
-    if (entry.status !== 'success') continue;
+  const addToUpdate = (code, data) => {
+    if (!updateMap[code]) updateMap[code] = {};
+    Object.assign(updateMap[code], data);
+  };
 
-    if (entry.video_url) {
-      const serverVideoUrl = await uploadFileToServer(entry.video_url);
+  const isInsta = (url) => url && (url.includes('cdninstagram.com') || url.includes('fbcdn.net') || url.includes('scontent'));
 
-      if (serverVideoUrl) {
-        mapping[code].server_video_url = serverVideoUrl;
-
-        // Convert to MP3 and upload
-        let serverAudioUrl = null;
-        try {
-          const inputPath = entry.video_url;
-          const outputPath = inputPath.replace(/\.[^/.]+$/, "") + ".mp3";
-
-          console.log(`🎵 Converting for Garbage Collector: ${inputPath} -> ${outputPath}`);
-          await execAsync(
-            `"${ffmpegPath}" -y -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${outputPath}"`
-          );
-
-          if (await fs.access(outputPath).then(() => true).catch(() => false)) {
-            serverAudioUrl = await uploadFileToServer(outputPath);
-            if (serverAudioUrl) {
-              mapping[code].server_audio_url = serverAudioUrl;
-            }
-          }
-        } catch (err) {
-          console.warn(`⚠️ Failed to generate/upload audio for ${code}: ${err.message}`);
-        }
-
-        updateMap[code] = {
-          video_url: serverVideoUrl,
-          audio_url: serverAudioUrl
-        };
+  const checkThumb = async (code, thumbUrl) => {
+    if (isInsta(thumbUrl)) {
+      console.log(`🖼️  [THUMB-RETRY] ${code}...`);
+      const res = await downloadAndUploadThumbnail(browser, `https://www.instagram.com/reel/${code}/`);
+      if (res?.uploadedUrl) {
+        addToUpdate(code, { thumbnail_url: res.uploadedUrl });
+        await upsertReelEntry(`https://www.instagram.com/reel/${code}/`, e => { e.thumbnailUrl = res.uploadedUrl; });
       }
     }
+  };
+
+  // 1. Process "BOTH" (Video + Audio)
+  for (const item of failedBoth) {
+    const { code, thumbnail_url } = item;
+    const linkUrl = `https://www.instagram.com/reel/${code}/`;
+    try {
+      console.log(`🎬 [BOTH] Processing ${code}...`);
+      await checkThumb(code, thumbnail_url);
+      await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
+      const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
+      if (entry && entry.downloaded && entry.filePath) {
+        const sUrl = await uploadFileToServer(entry.filePath);
+        if (sUrl) {
+          addToUpdate(code, { video_url: sUrl });
+          // Convert to MP3
+          const mp3Path = entry.filePath.replace(/\.[^/.]+$/, "") + ".mp3";
+          await execAsync(`"${ffmpegPath}" -y -i "${entry.filePath}" -vn -acodec libmp3lame -q:a 2 "${mp3Path}"`);
+          const aUrl = await uploadFileToServer(mp3Path);
+          if (aUrl) addToUpdate(code, { audio_url: aUrl });
+
+          await upsertReelEntry(linkUrl, e => {
+            e.serverMP4Url = sUrl;
+            if (aUrl) e.serverMP3Url = aUrl;
+            e.isConverted = true;
+          });
+        }
+      }
+    } catch (err) { console.error(`❌ BOTH failed for ${code}:`, err.message); }
   }
 
-  // Update mapping.json with server URLs
-  await fs.writeFile(mappingPath, JSON.stringify(mapping, null, 2), "utf8");
-  console.log(`📄 Updated mapping.json with server URLs at: ${mappingPath}`);
+  // 2. Process "VIDEOS" Only
+  for (const item of failedVideos) {
+    const { code, thumbnail_url } = item;
+    const linkUrl = `https://www.instagram.com/reel/${code}/`;
+    try {
+      console.log(`📹 [VIDEO] Processing ${code}...`);
+      await checkThumb(code, thumbnail_url);
+      await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
+      const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
+      if (entry && entry.downloaded && entry.filePath) {
+        const sUrl = await uploadFileToServer(entry.filePath);
+        if (sUrl) {
+          addToUpdate(code, { video_url: sUrl });
+          await upsertReelEntry(linkUrl, e => {
+            e.serverMP4Url = sUrl;
+            e.isConverted = true;
+          });
+        }
+      }
+    } catch (err) { console.error(`❌ Video failed for ${code}:`, err.message); }
+  }
+
+  // 3. Process "AUDIOS" Only
+  for (const item of failedAudios) {
+    const { code, server_video_url, thumbnail_url } = item;
+    const linkUrl = `https://www.instagram.com/reel/${code}/`;
+    try {
+      console.log(`🎵 [AUDIO] Processing ${code}...`);
+      await checkThumb(code, thumbnail_url);
+      if (server_video_url) {
+        // Download existing video to extract audio
+        const tempVideo = path.join(baseDir, `temp_${code}.mp4`);
+        const mp3Path = tempVideo.replace(".mp4", ".mp3");
+
+        const res = await fetch(server_video_url);
+        const buffer = await res.arrayBuffer();
+        await fs.writeFile(tempVideo, Buffer.from(buffer));
+
+        await execAsync(`"${ffmpegPath}" -y -i "${tempVideo}" -vn -acodec libmp3lame -q:a 2 "${mp3Path}"`);
+        const aUrl = await uploadFileToServer(mp3Path);
+        if (aUrl) {
+          addToUpdate(code, { audio_url: aUrl });
+          await upsertReelEntry(linkUrl, e => {
+            e.serverMP3Url = aUrl;
+            e.isConverted = true;
+          });
+        }
+
+        await fs.unlink(tempVideo).catch(() => { });
+        await fs.unlink(mp3Path).catch(() => { });
+      } else {
+        // Fallback to full download if no server video
+        await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
+        const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
+        if (entry && entry.downloaded && entry.filePath) {
+          const mp3Path = entry.filePath.replace(/\.[^/.]+$/, "") + ".mp3";
+          await execAsync(`"${ffmpegPath}" -y -i "${entry.filePath}" -vn -acodec libmp3lame -q:a 2 "${mp3Path}"`);
+          const aUrl = await uploadFileToServer(mp3Path);
+          if (aUrl) {
+            addToUpdate(code, { audio_url: aUrl });
+            await upsertReelEntry(linkUrl, e => {
+              e.serverMP3Url = aUrl;
+              e.isConverted = true;
+            });
+          }
+        }
+      }
+    } catch (err) { console.error(`❌ Audio failed for ${code}:`, err.message); }
+  }
+
+  // 4. Process "THUMBNAILS" Only
+  for (const item of failedThumbnails) {
+    const { code, thumbnail_url } = item;
+    try {
+      await checkThumb(code, thumbnail_url);
+    } catch (err) { console.error(`❌ Thumbnail failed for ${code}:`, err.message); }
+  }
+
+  // 5. Final Sync and Summary
+  for (const [code, data] of Object.entries(updateMap)) {
+    mapping[code] = { status: 'success', ...data };
+  }
 
   if (Object.keys(updateMap).length > 0) {
     try {
-      console.log(`📤 Syncing ${Object.keys(updateMap).length} video URLs to backend...`);
+      console.log(`📤 Sending batch update to backend for ${Object.keys(updateMap).length} items...`);
       const res = await fetch(BATCH_UPDATE_VIDEO_URLS_API_URL, {
         method: "POST",
         headers: {
@@ -1655,18 +1850,16 @@ export async function runGarbageCollector() {
         },
         body: JSON.stringify(updateMap),
       });
-      if (!res.ok) {
-        throw new Error(`Batch update video URLs failed: ${res.status} ${res.statusText}`);
-      }
-      const syncResult = await res.json();
-      console.log(`✅ Batch update video URLs completed:`, JSON.stringify(syncResult));
+      if (!res.ok) throw new Error(`Batch sync failed: ${res.status}`);
+      console.log(`✅ Backend sync complete.`);
     } catch (err) {
-      console.error(`❌ Failed to sync batch video URLs:`, err.message);
+      console.error(`❌ Sync failed:`, err.message);
     }
-  } else {
-    console.log("ℹ️ No successfully processed video URLs to sync.");
   }
 
+  const mappingPath = path.join(baseDir, "mapping.json");
+  await fs.writeFile(mappingPath, JSON.stringify(mapping, null, 2), "utf8");
+  console.log(`📄 Saved run mapping to: ${mappingPath}`);
   console.log("✅ Garbage Collector run finished.");
 
   if (localBrowser && browser) {
