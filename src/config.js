@@ -1,6 +1,7 @@
 import path from "node:path";
 
 const backendBaseUrl = "https://api-viralx.enpointe.io";
+// const backendBaseUrl = "http://localhost:3001";
 const INSTA_USER_LIST_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXJ2aWNlIjoiZXh0ZXJuYWwtc2VydmljZSIsImlhdCI6MTc2OTUyMzIzOSwiZXhwIjoxNzcyMTE1MjM5fQ.8UOhvJ-QBbsrod_gn-h0Z0uHz86MvDXBe4LIPeCTv1A";
 const REDIS_URL = "redis://:zd76LHosiqkgGzUBEX3R@161.118.188.181:6379";
 const HEADFUL = "1";
