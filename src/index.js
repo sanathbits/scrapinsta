@@ -1693,6 +1693,10 @@ export async function runGarbageCollector(options = {}) {
 
   const failedData = await getFailedMediaCodes();
   const { videos: failedVideos = [], audios: failedAudios = [], thumbnails: failedThumbnails = [], both: failedBoth = [] } = failedData;
+  const bothCodes = new Set(failedBoth.map((item) => item.code));
+  const failedVideosOnly = failedVideos.filter((item) => !bothCodes.has(item.code));
+  const failedAudiosOnly = failedAudios.filter((item) => !bothCodes.has(item.code));
+  const failedThumbnailsOnly = failedThumbnails.filter((item) => !bothCodes.has(item.code));
 
   const total = failedVideos.length + failedAudios.length + failedThumbnails.length + failedBoth.length;
   console.log(`📊 Found ${total} failed media items (${failedVideos.length}V, ${failedAudios.length}A, ${failedThumbnails.length}T, ${failedBoth.length}B).`);
@@ -1733,21 +1737,35 @@ export async function runGarbageCollector(options = {}) {
     const linkUrl = `https://www.instagram.com/reel/${code}/`;
     try {
       console.log(`🎬 [BOTH] Processing ${code}...`);
-      await checkThumb(code, thumbnail_url);
-      await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
-      const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
-      if (entry && entry.downloaded && entry.filePath) {
-        const sUrl = await uploadFileToServer(entry.filePath);
-        if (sUrl) {
-          addToUpdate(code, { video_url: sUrl });
-          // Convert to MP3
-          const mp3Path = entry.filePath.replace(/\.[^/.]+$/, "") + ".mp3";
-          await execAsync(`"${ffmpegPath}" -y -i "${entry.filePath}" -vn -acodec libmp3lame -q:a 2 "${mp3Path}"`);
-          const aUrl = await uploadFileToServer(mp3Path);
-          if (aUrl) addToUpdate(code, { audio_url: aUrl });
+      if (thumbnail) {
+        await checkThumb(code, thumbnail_url);
+      }
+      if (video || audio) {
+        await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
+        const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
+        if (entry && entry.downloaded && entry.filePath) {
+          let sUrl = null;
+          let aUrl = null;
+
+          if (video) {
+            sUrl = await uploadFileToServer(entry.filePath);
+            if (sUrl) {
+              addToUpdate(code, { video_url: sUrl });
+            }
+          }
+
+          if (audio) {
+            const mp3Path = entry.filePath.replace(/\.[^/.]+$/, "") + ".mp3";
+            await execAsync(`"${ffmpegPath}" -y -i "${entry.filePath}" -vn -acodec libmp3lame -q:a 2 "${mp3Path}"`);
+            aUrl = await uploadFileToServer(mp3Path);
+            if (aUrl) {
+              addToUpdate(code, { audio_url: aUrl });
+            }
+            await fs.unlink(mp3Path).catch(() => { });
+          }
 
           await upsertReelEntry(linkUrl, e => {
-            e.serverMP4Url = sUrl;
+            if (sUrl) e.serverMP4Url = sUrl;
             if (aUrl) e.serverMP3Url = aUrl;
             e.isConverted = true;
           });
@@ -1757,12 +1775,14 @@ export async function runGarbageCollector(options = {}) {
   }
 
   // 2. Process "VIDEOS" Only
-  for (const item of failedVideos) {
+  if (video) for (const item of failedVideosOnly) {
     const { code, thumbnail_url } = item;
     const linkUrl = `https://www.instagram.com/reel/${code}/`;
     try {
       console.log(`📹 [VIDEO] Processing ${code}...`);
-      await checkThumb(code, thumbnail_url);
+      if (thumbnail) {
+        await checkThumb(code, thumbnail_url);
+      }
       await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
       const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
       if (entry && entry.downloaded && entry.filePath) {
@@ -1779,12 +1799,14 @@ export async function runGarbageCollector(options = {}) {
   }
 
   // 3. Process "AUDIOS" Only
-  for (const item of failedAudios) {
+  if (audio) for (const item of failedAudiosOnly) {
     const { code, server_video_url, thumbnail_url } = item;
     const linkUrl = `https://www.instagram.com/reel/${code}/`;
     try {
       console.log(`🎵 [AUDIO] Processing ${code}...`);
-      await checkThumb(code, thumbnail_url);
+      if (thumbnail) {
+        await checkThumb(code, thumbnail_url);
+      }
       if (server_video_url) {
         // Download existing video to extract audio
         const tempVideo = path.join(baseDir, `temp_${code}.mp4`);
@@ -1821,13 +1843,14 @@ export async function runGarbageCollector(options = {}) {
               e.isConverted = true;
             });
           }
+          await fs.unlink(mp3Path).catch(() => { });
         }
       }
     } catch (err) { console.error(`❌ Audio failed for ${code}:`, err.message); }
   }
 
   // 4. Process "THUMBNAILS" Only
-  for (const item of failedThumbnails) {
+  if (thumbnail) for (const item of failedThumbnailsOnly) {
     const { code, thumbnail_url } = item;
     try {
       await checkThumb(code, thumbnail_url);
@@ -1879,7 +1902,12 @@ function initBullMQWorker() {
   const worker = new Worker('failed-media-retry', async job => {
     console.log(`📥 Received BullMQ job: ${job.name}`, job.data);
     if (job.name === 'retry-failed-media') {
-      await runGarbageCollector();
+      const mediaType = job.data?.mediaType || 'all';
+      await runGarbageCollector({
+        video: mediaType === 'all' || mediaType === 'video',
+        audio: mediaType === 'all' || mediaType === 'audio',
+        thumbnail: mediaType === 'all' || mediaType === 'thumbnail',
+      });
     }
   }, { connection });
 
