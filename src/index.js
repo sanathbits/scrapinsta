@@ -1668,8 +1668,9 @@ async function getFailedMediaCodes() {
   }
 }
 
-export async function runGarbageCollector(options = {}) {
+export async function runGarbageCollector(options = {}, job = null) {
   const { video = true, audio = true, thumbnail = true } = options;
+  const startedAt = Date.now();
   console.log(`♻️  Starting Garbage Collector - video:${video}, audio:${audio}, thumbnail:${thumbnail}`);
 
   let localBrowser = false;
@@ -1698,7 +1699,61 @@ export async function runGarbageCollector(options = {}) {
   const failedAudiosOnly = failedAudios.filter((item) => !bothCodes.has(item.code));
   const failedThumbnailsOnly = failedThumbnails.filter((item) => !bothCodes.has(item.code));
 
-  const total = failedVideos.length + failedAudios.length + failedThumbnails.length + failedBoth.length;
+  const total = failedBoth.length + failedVideosOnly.length + failedAudiosOnly.length + failedThumbnailsOnly.length;
+  let processedItems = 0;
+  let successfulItems = 0;
+  let failedItems = 0;
+
+  const updateJobProgress = async (phase, currentCode = null, currentStep = null) => {
+    if (!job) {
+      return;
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const avgMsPerItem = processedItems > 0 ? elapsedMs / processedItems : null;
+    const pendingItems = Math.max(total - processedItems, 0);
+    const estimatedRemainingMs = avgMsPerItem ? Math.round(avgMsPerItem * pendingItems) : null;
+
+    await job.updateProgress({
+      phase,
+      totalItems: total,
+      processedItems,
+      successfulItems,
+      failedItems,
+      pendingItems,
+      percentage: total > 0 ? Math.min(100, Math.round((processedItems / total) * 100)) : 100,
+      currentCode,
+      currentStep,
+      elapsedMs,
+      estimatedRemainingMs,
+      lastUpdatedAt: new Date().toISOString(),
+      breakdown: {
+        videos: failedVideos.length,
+        audios: failedAudios.length,
+        thumbnails: failedThumbnails.length,
+        both: failedBoth.length
+      }
+    });
+  };
+  if (total === 0) {
+    console.log("No failed media to process.");
+    await updateJobProgress('completed');
+    return {
+      totalItems: 0,
+      processedItems: 0,
+      successfulItems: 0,
+      failedItems: 0,
+      updatedItems: 0,
+      startedAt: new Date(startedAt).toISOString(),
+      finishedAt: new Date().toISOString(),
+      breakdown: {
+        videos: failedVideos.length,
+        audios: failedAudios.length,
+        thumbnails: failedThumbnails.length,
+        both: failedBoth.length
+      }
+    };
+  }
   console.log(`📊 Found ${total} failed media items (${failedVideos.length}V, ${failedAudios.length}A, ${failedThumbnails.length}T, ${failedBoth.length}B).`);
 
   if (total === 0) {
@@ -1720,8 +1775,16 @@ export async function runGarbageCollector(options = {}) {
 
   const isInsta = (url) => url && (url.includes('cdninstagram.com') || url.includes('fbcdn.net') || url.includes('scontent'));
 
-  const checkThumb = async (code, thumbUrl) => {
-    if (isInsta(thumbUrl)) {
+  const shouldRetryThumbnail = (thumbUrl, thumbnailStatus) => {
+    if (thumbnailStatus?.is_failed === true) {
+      return true;
+    }
+
+    return !thumbUrl || isInsta(thumbUrl);
+  };
+
+  const checkThumb = async (code, thumbUrl, thumbnailStatus) => {
+    if (shouldRetryThumbnail(thumbUrl, thumbnailStatus)) {
       console.log(`🖼️  [THUMB-RETRY] ${code}...`);
       const res = await downloadAndUploadThumbnail(browser, `https://www.instagram.com/reel/${code}/`);
       if (res?.uploadedUrl) {
@@ -1733,12 +1796,13 @@ export async function runGarbageCollector(options = {}) {
 
   // 1. Process "BOTH" (Video + Audio)
   for (const item of failedBoth) {
-    const { code, thumbnail_url } = item;
+    const { code, thumbnail_url, thumbnail_status } = item;
     const linkUrl = `https://www.instagram.com/reel/${code}/`;
     try {
+      await updateJobProgress('processing', code, 'both');
       console.log(`🎬 [BOTH] Processing ${code}...`);
       if (thumbnail) {
-        await checkThumb(code, thumbnail_url);
+        await checkThumb(code, thumbnail_url, thumbnail_status);
       }
       if (video || audio) {
         await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
@@ -1772,16 +1836,20 @@ export async function runGarbageCollector(options = {}) {
         }
       }
     } catch (err) { console.error(`❌ BOTH failed for ${code}:`, err.message); }
+    processedItems++;
+    successfulItems = Math.max(processedItems - failedItems, 0);
+    await updateJobProgress('processing', code, 'both');
   }
 
   // 2. Process "VIDEOS" Only
   if (video) for (const item of failedVideosOnly) {
-    const { code, thumbnail_url } = item;
+    const { code, thumbnail_url, thumbnail_status } = item;
     const linkUrl = `https://www.instagram.com/reel/${code}/`;
     try {
+      await updateJobProgress('processing', code, 'video');
       console.log(`📹 [VIDEO] Processing ${code}...`);
       if (thumbnail) {
-        await checkThumb(code, thumbnail_url);
+        await checkThumb(code, thumbnail_url, thumbnail_status);
       }
       await processLinkInTab(browser, linkUrl, baseDir, { skipInstagram: true });
       const entry = (await loadAllReels()).find(e => e.linkUrl === linkUrl);
@@ -1796,16 +1864,20 @@ export async function runGarbageCollector(options = {}) {
         }
       }
     } catch (err) { console.error(`❌ Video failed for ${code}:`, err.message); }
+    processedItems++;
+    successfulItems = Math.max(processedItems - failedItems, 0);
+    await updateJobProgress('processing', code, 'video');
   }
 
   // 3. Process "AUDIOS" Only
   if (audio) for (const item of failedAudiosOnly) {
-    const { code, server_video_url, thumbnail_url } = item;
+    const { code, server_video_url, thumbnail_url, thumbnail_status } = item;
     const linkUrl = `https://www.instagram.com/reel/${code}/`;
     try {
+      await updateJobProgress('processing', code, 'audio');
       console.log(`🎵 [AUDIO] Processing ${code}...`);
       if (thumbnail) {
-        await checkThumb(code, thumbnail_url);
+        await checkThumb(code, thumbnail_url, thumbnail_status);
       }
       if (server_video_url) {
         // Download existing video to extract audio
@@ -1847,14 +1919,21 @@ export async function runGarbageCollector(options = {}) {
         }
       }
     } catch (err) { console.error(`❌ Audio failed for ${code}:`, err.message); }
+    processedItems++;
+    successfulItems = Math.max(processedItems - failedItems, 0);
+    await updateJobProgress('processing', code, 'audio');
   }
 
   // 4. Process "THUMBNAILS" Only
   if (thumbnail) for (const item of failedThumbnailsOnly) {
-    const { code, thumbnail_url } = item;
+    const { code, thumbnail_url, thumbnail_status } = item;
     try {
-      await checkThumb(code, thumbnail_url);
+      await updateJobProgress('processing', code, 'thumbnail');
+      await checkThumb(code, thumbnail_url, thumbnail_status);
     } catch (err) { console.error(`❌ Thumbnail failed for ${code}:`, err.message); }
+    processedItems++;
+    successfulItems = Math.max(processedItems - failedItems, 0);
+    await updateJobProgress('processing', code, 'thumbnail');
   }
 
   // 5. Final Sync and Summary
@@ -1890,6 +1969,25 @@ export async function runGarbageCollector(options = {}) {
     await browser.close();
     browser = null;
   }
+  const summary = {
+    totalItems: total,
+    processedItems,
+    successfulItems: Math.max(processedItems - failedItems, 0),
+    failedItems,
+    updatedItems: Object.keys(updateMap).length,
+    mappingPath,
+    startedAt: new Date(startedAt).toISOString(),
+    finishedAt: new Date().toISOString(),
+    breakdown: {
+      videos: failedVideos.length,
+      audios: failedAudios.length,
+      thumbnails: failedThumbnails.length,
+      both: failedBoth.length
+    }
+  };
+
+  await updateJobProgress('completed');
+  return summary;
 }
 
 function initBullMQWorker() {
@@ -1903,11 +2001,11 @@ function initBullMQWorker() {
     console.log(`📥 Received BullMQ job: ${job.name}`, job.data);
     if (job.name === 'retry-failed-media') {
       const mediaType = job.data?.mediaType || 'all';
-      await runGarbageCollector({
+      return runGarbageCollector({
         video: mediaType === 'all' || mediaType === 'video',
         audio: mediaType === 'all' || mediaType === 'audio',
         thumbnail: mediaType === 'all' || mediaType === 'thumbnail',
-      });
+      }, job);
     }
   }, { connection });
 
