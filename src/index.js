@@ -1642,13 +1642,22 @@ async function processLinkInTab(browser, linkUrl, outDir, options = {}) {
   await tab.close().catch(() => { });
 }
 
-async function getFailedMediaCodes() {
+async function getFailedMediaCodes(options = {}) {
   if (!INSTA_USER_LIST_TOKEN) {
     console.warn("INSTA_USER_LIST_TOKEN not set; returning empty object.");
     return {};
   }
   try {
-    const res = await fetch(GET_FAILED_MEDIA_CODES_API_URL, {
+    const mediaType = options.mediaType || 'all';
+    const postId = options.postId || null;
+    const url = new URL(GET_FAILED_MEDIA_CODES_API_URL);
+    url.searchParams.set("mediaType", mediaType);
+    url.searchParams.set("verifyStorage", "false");
+    if (postId) {
+      url.searchParams.set("postId", postId);
+    }
+
+    const res = await fetch(url.toString(), {
       method: "GET",
       headers: {
         Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
@@ -1669,7 +1678,7 @@ async function getFailedMediaCodes() {
 }
 
 export async function runGarbageCollector(options = {}, job = null) {
-  const { video = true, audio = true, thumbnail = true } = options;
+  const { video = true, audio = true, thumbnail = true, postId = null } = options;
   const startedAt = Date.now();
   console.log(`♻️  Starting Garbage Collector - video:${video}, audio:${audio}, thumbnail:${thumbnail}`);
 
@@ -1692,7 +1701,20 @@ export async function runGarbageCollector(options = {}, job = null) {
     localBrowser = true;
   }
 
-  const failedData = await getFailedMediaCodes();
+  const requestedMediaType = video && audio && thumbnail
+    ? 'all'
+    : thumbnail && !video && !audio
+      ? 'thumbnail'
+      : video && !audio && !thumbnail
+        ? 'video'
+        : audio && !video && !thumbnail
+          ? 'audio'
+          : 'all';
+
+  const failedData = await getFailedMediaCodes({
+    mediaType: requestedMediaType,
+    postId
+  });
   const { videos: failedVideos = [], audios: failedAudios = [], thumbnails: failedThumbnails = [], both: failedBoth = [] } = failedData;
   const bothCodes = new Set(failedBoth.map((item) => item.code));
   const failedVideosOnly = failedVideos.filter((item) => !bothCodes.has(item.code));
@@ -2005,6 +2027,7 @@ function initBullMQWorker() {
         video: mediaType === 'all' || mediaType === 'video',
         audio: mediaType === 'all' || mediaType === 'audio',
         thumbnail: mediaType === 'all' || mediaType === 'thumbnail',
+        postId: job.data?.postId || null,
       }, job);
     }
   }, { connection });
