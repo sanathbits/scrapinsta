@@ -24,6 +24,7 @@ const config = {
 config.instaUserListApiUrl = `${backendBaseUrl}/api/v1/external/getProfileInstaUserList`;
 config.getFailedMediaCodesApiUrl = `${backendBaseUrl}/api/v1/external/getFailedMediaCodes`;
 config.uploadMediaApiUrl = `${backendBaseUrl}/api/v1/external/upload/media`;
+config.triggerRetryMediaJobApiUrl = `${backendBaseUrl}/api/v1/external/triggerRetryMediaJob`;
 config.updateProfileBaseUrl = `${backendBaseUrl}/api/v1/external/updateProfileById`;
 config.updatePostsBaseUrl = `${backendBaseUrl}/api/v1/external/updateContentById`;
 config.batchSyncRetriedMediaApiUrl = `${backendBaseUrl}/api/v1/external/batchSyncRetriedmedia`;

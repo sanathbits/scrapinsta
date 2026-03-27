@@ -14,6 +14,25 @@ const ffmpegPath = ffmpegInstaller.path;
 const execAsync = promisify(exec);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+async function postJson(url, body, extraHeaders = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+      ...extraHeaders,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`POST ${url} failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`);
+  }
+
+  return res.json().catch(() => ({}));
+}
+
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 
@@ -29,6 +48,7 @@ const UPDATE_POSTS_BASE_URL = config.updatePostsBaseUrl;
 const GET_FAILED_MEDIA_CODES_API_URL = config.getFailedMediaCodesApiUrl;
 const BATCH_SYNC_RETRIED_MEDIA_URL = config.batchSyncRetriedMediaApiUrl;
 const BATCH_UPDATE_VIDEO_URLS_API_URL = config.batchUpdateVideoUrlsApiUrl;
+const TRIGGER_RETRY_MEDIA_JOB_URL = config.triggerRetryMediaJobApiUrl;
 const REDIS_URL = config.redisUrl || "redis://localhost:6379";
 
 async function loadAllReels() {
@@ -2022,14 +2042,34 @@ function initBullMQWorker() {
   const worker = new Worker('failed-media-retry', async job => {
     console.log(`📥 Received BullMQ job: ${job.name}`, job.data);
     if (job.name === 'retry-failed-media') {
+      const nodeJobId = job.data?.nodeJobId;
+      if (!nodeJobId) {
+        throw new Error('retry-failed-media job is missing nodeJobId');
+      }
+
       const mediaType = job.data?.mediaType || 'all';
-      return runGarbageCollector({
-        video: mediaType === 'all' || mediaType === 'video',
-        audio: mediaType === 'all' || mediaType === 'audio',
-        thumbnail: mediaType === 'all' || mediaType === 'thumbnail',
-        postId: job.data?.postId || null,
-      }, job);
+      const postId = job.data?.postId || null;
+
+      if (!TRIGGER_RETRY_MEDIA_JOB_URL) {
+        throw new Error('triggerRetryMediaJobApiUrl is not configured');
+      }
+
+      const result = await postJson(TRIGGER_RETRY_MEDIA_JOB_URL, {
+        jobId: nodeJobId,
+        mediaType,
+        postId,
+      });
+
+      console.log(`🚀 Dispatched retry job ${nodeJobId} to backend cron`, result);
+      return result;
     }
+
+    if (job.name === 'retry-failed-media-complete') {
+      console.log(`✅ Received retry completion signal for job ${job.data?.nodeJobId}`, job.data);
+      return job.data || null;
+    }
+
+    return null;
   }, { connection });
 
   worker.on('completed', job => {
