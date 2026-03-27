@@ -1877,6 +1877,31 @@ export async function runGarbageCollector(options = {}, job = null) {
     Object.assign(updateMap[code], data);
   };
 
+  const flushUpdateMap = async (reason = "threshold", force = false) => {
+    const updateCount = Object.keys(updateMap).length;
+    if (updateCount === 0) return;
+    if (!force && updateCount < 50) return;
+
+    const payload = { ...updateMap };
+    console.log(`📤 Sending batch update to backend for ${Object.keys(payload).length} items (${reason})...`);
+    const res = await fetch(BATCH_UPDATE_VIDEO_URLS_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`Batch sync failed: ${res.status}`);
+
+    for (const [code, data] of Object.entries(payload)) {
+      mapping[code] = { status: 'success', ...data };
+      delete updateMap[code];
+    }
+
+    console.log(`✅ Backend sync complete (${reason}).`);
+  };
+
   const isInsta = (url) => url && (url.includes('cdninstagram.com') || url.includes('fbcdn.net') || url.includes('scontent'));
 
   const shouldRetryThumbnail = (thumbUrl, thumbnailStatus) => {
@@ -1940,6 +1965,7 @@ export async function runGarbageCollector(options = {}, job = null) {
         }
       }
     } catch (err) { console.error(`❌ BOTH failed for ${code}:`, err.message); }
+    await flushUpdateMap("threshold");
     processedItems++;
     successfulItems = Math.max(processedItems - failedItems, 0);
     await updateJobProgress('processing', code, 'both');
@@ -1968,6 +1994,7 @@ export async function runGarbageCollector(options = {}, job = null) {
         }
       }
     } catch (err) { console.error(`❌ Video failed for ${code}:`, err.message); }
+    await flushUpdateMap("threshold");
     processedItems++;
     successfulItems = Math.max(processedItems - failedItems, 0);
     await updateJobProgress('processing', code, 'video');
@@ -2023,6 +2050,7 @@ export async function runGarbageCollector(options = {}, job = null) {
         }
       }
     } catch (err) { console.error(`❌ Audio failed for ${code}:`, err.message); }
+    await flushUpdateMap("threshold");
     processedItems++;
     successfulItems = Math.max(processedItems - failedItems, 0);
     await updateJobProgress('processing', code, 'audio');
@@ -2035,32 +2063,17 @@ export async function runGarbageCollector(options = {}, job = null) {
       await updateJobProgress('processing', code, 'thumbnail');
       await checkThumb(code, thumbnail_url, thumbnail_status);
     } catch (err) { console.error(`❌ Thumbnail failed for ${code}:`, err.message); }
+    await flushUpdateMap("threshold");
     processedItems++;
     successfulItems = Math.max(processedItems - failedItems, 0);
     await updateJobProgress('processing', code, 'thumbnail');
   }
 
   // 5. Final Sync and Summary
-  for (const [code, data] of Object.entries(updateMap)) {
-    mapping[code] = { status: 'success', ...data };
-  }
-
-  if (Object.keys(updateMap).length > 0) {
-    try {
-      console.log(`📤 Sending batch update to backend for ${Object.keys(updateMap).length} items...`);
-      const res = await fetch(BATCH_UPDATE_VIDEO_URLS_API_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${INSTA_USER_LIST_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(updateMap),
-      });
-      if (!res.ok) throw new Error(`Batch sync failed: ${res.status}`);
-      console.log(`✅ Backend sync complete.`);
-    } catch (err) {
-      console.error(`❌ Sync failed:`, err.message);
-    }
+  try {
+    await flushUpdateMap("final", true);
+  } catch (err) {
+    console.error(`❌ Sync failed:`, err.message);
   }
 
   const mappingPath = path.join(baseDir, "mapping.json");
