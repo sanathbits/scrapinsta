@@ -1400,7 +1400,13 @@ async function updateContentReels() {
       comment_count: parseCount(entry.comments),
       caption_text: entry.caption ?? "",
       video_url: entry.serverMP4Url,
-      thumbnail_url: entry.thumbnailUrl ?? "",
+      thumbnail_url: entry.thumbnailUrl && !(
+        entry.thumbnailUrl.includes("cdninstagram.com") ||
+        entry.thumbnailUrl.includes("fbcdn.net") ||
+        entry.thumbnailUrl.includes("scontent")
+      )
+        ? entry.thumbnailUrl
+        : undefined,
       audio_url: entry.serverMP3Url ?? null,
       video_duration: 0,
       has_audio: true,
