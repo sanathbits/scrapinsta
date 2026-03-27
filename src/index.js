@@ -49,6 +49,7 @@ const GET_FAILED_MEDIA_CODES_API_URL = config.getFailedMediaCodesApiUrl;
 const BATCH_SYNC_RETRIED_MEDIA_URL = config.batchSyncRetriedMediaApiUrl;
 const BATCH_UPDATE_VIDEO_URLS_API_URL = config.batchUpdateVideoUrlsApiUrl;
 const TRIGGER_RETRY_MEDIA_JOB_URL = config.triggerRetryMediaJobApiUrl;
+const COMPLETE_RETRY_MEDIA_JOB_URL = config.completeRetryMediaJobApiUrl;
 const REDIS_URL = config.redisUrl || "redis://localhost:6379";
 
 async function loadAllReels() {
@@ -2114,18 +2115,53 @@ function initBullMQWorker() {
       if (!TRIGGER_RETRY_MEDIA_JOB_URL) {
         throw new Error('triggerRetryMediaJobApiUrl is not configured');
       }
+      if (!COMPLETE_RETRY_MEDIA_JOB_URL) {
+        throw new Error('completeRetryMediaJobApiUrl is not configured');
+      }
 
       setRetryFlowActive(nodeJobId);
       try {
-        const result = await postJson(TRIGGER_RETRY_MEDIA_JOB_URL, {
+        const startResult = await postJson(TRIGGER_RETRY_MEDIA_JOB_URL, {
           jobId: nodeJobId,
           mediaType,
           postId,
         });
 
-        console.log(`🚀 Dispatched retry job ${nodeJobId} to backend cron`, result);
-        return result;
+        console.log(`🚀 Started retry job ${nodeJobId} in backend`, startResult);
+
+        const retryOptions = {
+          video: mediaType === 'all' || mediaType === 'video',
+          audio: mediaType === 'all' || mediaType === 'audio',
+          thumbnail: mediaType === 'all' || mediaType === 'thumbnail',
+          postId
+        };
+
+        const summary = await runGarbageCollector(retryOptions, job);
+        const completeResult = await postJson(COMPLETE_RETRY_MEDIA_JOB_URL, {
+          jobId: nodeJobId,
+          summary,
+          success: true
+        });
+
+        console.log(`✅ Completed retry job ${nodeJobId}`, completeResult);
+
+        await failedMediaQueue.add('retry-failed-media-complete', {
+          nodeJobId,
+          summary
+        });
+
+        return summary;
       } catch (err) {
+        try {
+          await postJson(COMPLETE_RETRY_MEDIA_JOB_URL, {
+            jobId: nodeJobId,
+            summary: null,
+            success: false,
+            errorMessage: err?.message || String(err)
+          });
+        } catch (completeErr) {
+          console.error(`Failed to finalize retry job ${nodeJobId}:`, completeErr?.message || completeErr);
+        }
         clearRetryFlowActive(nodeJobId);
         throw err;
       }
