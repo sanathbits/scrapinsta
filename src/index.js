@@ -804,6 +804,7 @@ async function updateUserProfiles() {
     return;
   }
   for (const p of profiles) {
+    await waitForRetryFlowIfActive("updateUserProfiles");
     const username = p.username;
     if (!username) continue;
     let profilePicUrl = p.profile_pic_url ?? p.profilePicUrl ?? "";
@@ -902,6 +903,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
   const combined = [];
   const recoverableErrors = [];
   for (const username of usernameArray) {
+    await waitForRetryFlowIfActive(`getUserData:${username}`);
     let url = null;
     try {
       url = new URL(username + "/reels/", targetUrl).toString();
@@ -977,6 +979,7 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
     console.warn(`[getUserData] completed with ${recoverableErrors.length} recoverable error(s).`);
   }
 
+  await waitForRetryFlowIfActive("getUserData:before-conversion");
   await convertMP4toMP3();
   await sleep(1000);
 
@@ -988,6 +991,7 @@ async function convertMP4toMP3() {
   let changed = false;
 
   for (const entry of reels) {
+    await waitForRetryFlowIfActive("convertMP4toMP3");
     if (!entry.downloaded) continue;
     if (entry.isConverted) continue;
     if (!entry.filePath) continue;
@@ -1386,6 +1390,7 @@ async function updateContentReels() {
 
   // Send PUT for each user
   for (const [username, items] of Object.entries(reelsByUser)) {
+    await waitForRetryFlowIfActive("updateContentReels");
     const payloadReels = items.map(({ entry, code }) => ({
       instagram_media_id: "sb_" + code,
       code: code,
@@ -2104,18 +2109,25 @@ function initBullMQWorker() {
         throw new Error('triggerRetryMediaJobApiUrl is not configured');
       }
 
-      const result = await postJson(TRIGGER_RETRY_MEDIA_JOB_URL, {
-        jobId: nodeJobId,
-        mediaType,
-        postId,
-      });
+      setRetryFlowActive(nodeJobId);
+      try {
+        const result = await postJson(TRIGGER_RETRY_MEDIA_JOB_URL, {
+          jobId: nodeJobId,
+          mediaType,
+          postId,
+        });
 
-      console.log(`🚀 Dispatched retry job ${nodeJobId} to backend cron`, result);
-      return result;
+        console.log(`🚀 Dispatched retry job ${nodeJobId} to backend cron`, result);
+        return result;
+      } catch (err) {
+        clearRetryFlowActive(nodeJobId);
+        throw err;
+      }
     }
 
     if (job.name === 'retry-failed-media-complete') {
       console.log(`✅ Received retry completion signal for job ${job.data?.nodeJobId}`, job.data);
+      clearRetryFlowActive(job.data?.nodeJobId);
       return job.data || null;
     }
 
@@ -2136,6 +2148,10 @@ function initBullMQWorker() {
 
 async function runGoogleKeepAlive() {
   console.log("Running Google Keep Alive");
+  if (retryFlowActive) {
+    console.log("Retry flow is active; skipping Google Keep Alive.");
+    return;
+  }
   // const browser = await launchBrowser({ headful: true, profileDir: resolveProfileDir() });
   await googleKeepAlive(browser);
   // await browser.close();
@@ -2147,6 +2163,7 @@ async function getInstagramData() {
     console.error("Browser not initialized");
     return;
   }
+  await waitForRetryFlowIfActive("getInstagramData:start");
 
   const targetUrl = getArgUrl();
   const outDir = path.resolve(process.cwd(), "output", tsDirName());
@@ -2243,6 +2260,10 @@ async function main() {
 
       console.log("Running loop userDataCount", userDataCount, "googleKeepAliveCount", googleKeepAliveCount, "userDataRetrival", userDataRetrival);
       if (!userDataRetrival) {
+        if (retryFlowActive) {
+          console.log("Retry flow is active; main capture loop is paused.");
+          return;
+        }
         userDataCount++;
         googleKeepAliveCount++;
         if (userDataCount >= targetUserDataCount) {
@@ -2251,6 +2272,10 @@ async function main() {
           await getInstagramData();
         } else if (googleKeepAliveCount >= targetGoogleKeepAliveCount) {
           googleKeepAliveCount = 0;
+          if (retryFlowActive) {
+            console.log("Retry flow is active; skipping scheduled keepalive.");
+            return;
+          }
           await runGoogleKeepAlive();
         }
       }
@@ -2275,6 +2300,44 @@ let targetUserDataCount = 3;
 let targetGoogleKeepAliveCount = 15;
 
 let userDataRetrival = false
+let retryFlowActive = false;
+let retryFlowJobId = null;
+let retryFlowChangedAt = null;
+
+function setRetryFlowActive(jobId) {
+  retryFlowActive = true;
+  retryFlowJobId = jobId || null;
+  retryFlowChangedAt = Date.now();
+  console.log(
+    `[retry-flow] paused main flow for job ${retryFlowJobId || "unknown"} at ${new Date(
+      retryFlowChangedAt
+    ).toISOString()}`
+  );
+}
+
+function clearRetryFlowActive(jobId) {
+  if (!retryFlowActive) return;
+  const currentJobId = retryFlowJobId;
+  retryFlowActive = false;
+  retryFlowJobId = null;
+  retryFlowChangedAt = Date.now();
+  console.log(
+    `[retry-flow] resumed main flow after job ${jobId || currentJobId || "unknown"} at ${new Date(
+      retryFlowChangedAt
+    ).toISOString()}`
+  );
+}
+
+async function waitForRetryFlowIfActive(context = "main-flow") {
+  while (retryFlowActive) {
+    const activeForMs = retryFlowChangedAt ? Date.now() - retryFlowChangedAt : 0;
+    console.log(
+      `[retry-flow] ${context} is paused for retry job ${retryFlowJobId || "unknown"} ` +
+        `(${Math.round(activeForMs / 1000)}s). Waiting...`
+    );
+    await sleep(5000);
+  }
+}
 
 let maxLinksPerUser = 120;
 
