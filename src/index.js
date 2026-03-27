@@ -900,45 +900,82 @@ async function getUserData({ browser, page, targetUrl, outDir }) {
   }
 
   const combined = [];
+  const recoverableErrors = [];
   for (const username of usernameArray) {
-    const url = new URL(username + "/reels/", targetUrl).toString();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    await sleep(1500);
-
-    const htmlPath = path.join(outDir, `page-${username}.html`);
-    const html = await page.content();
-    await fs.writeFile(htmlPath, html, "utf8");
-
-    const stats = await extractProfileStats(page, html, username, outDir);
-    const links = await extractUserHrefPaths(page, username);
-    console.log(links);
-    const filteredLinks = [];
-    for (const obj of links) {
-      if (obj.href.includes("/reel/") && filteredLinks.length < maxLinksPerUser) {
-        filteredLinks.push(obj.href);
+    let url = null;
+    try {
+      url = new URL(username + "/reels/", targetUrl).toString();
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded" });
+      } catch (err) {
+        console.error(`[getUserData] page.goto failed for ${username}:`, err?.message || err);
+        console.error(`[getUserData] url: ${url}`);
+        recoverableErrors.push({ username, stage: "goto", url, error: err?.message || String(err) });
+        continue;
       }
+
+      await sleep(1500);
+
+      const htmlPath = path.join(outDir, `page-${username}.html`);
+      const html = await page.content();
+      await fs.writeFile(htmlPath, html, "utf8");
+
+      const stats = await extractProfileStats(page, html, username, outDir);
+      const links = await extractUserHrefPaths(page, username);
+      console.log(links);
+      const filteredLinks = [];
+      for (const obj of links) {
+        if (obj.href.includes("/reel/") && filteredLinks.length < maxLinksPerUser) {
+          filteredLinks.push(obj.href);
+        }
+      }
+
+      const record = { username, url, ...stats, hrefs: filteredLinks, links };
+      combined.push(record);
+      const statsPath = path.join(outDir, `profile-${username}.json`);
+      await fs.writeFile(statsPath, JSON.stringify(record, null, 2), "utf8");
+      const tasks = [];
+
+      for (const link of filteredLinks) {
+        try {
+          const linkUrl = new URL(link, targetUrl).toString();
+          const task = await processLinkInTab(browser, linkUrl, outDir);
+          await sleep(1000);
+          tasks.push(task);
+        } catch (err) {
+          console.error(`[getUserData] processLinkInTab failed for ${username}:`, err?.message || err);
+          recoverableErrors.push({
+            username,
+            stage: "reel",
+            url: link,
+            error: err?.message || String(err),
+          });
+        }
+      }
+      await Promise.allSettled(tasks);
+
+      console.log(`Saved:\n- ${htmlPath}\n- ${statsPath}`);
+    } catch (err) {
+      console.error(`[getUserData] failed for ${username}:`, err?.message || err);
+      if (url) {
+        console.error(`[getUserData] url: ${url}`);
+      }
+      recoverableErrors.push({
+        username,
+        stage: "user",
+        url,
+        error: err?.message || String(err),
+      });
     }
-
-    const record = { username, url, ...stats, hrefs: filteredLinks, links };
-    combined.push(record);
-    const statsPath = path.join(outDir, `profile-${username}.json`);
-    await fs.writeFile(statsPath, JSON.stringify(record, null, 2), "utf8");
-    const tasks = [];
-
-    for (const link of filteredLinks) {
-      const linkUrl = new URL(link, targetUrl).toString();
-      const task = await processLinkInTab(browser, linkUrl, outDir);
-      await sleep(1000);
-      tasks.push(task);
-    }
-    await Promise.allSettled(tasks);
-
-    console.log(`Saved:\n- ${htmlPath}\n- ${statsPath}`);
   }
 
   const combinedPath = ALL_PROFILES_PATH;
   await fs.writeFile(combinedPath, JSON.stringify(combined, null, 2), "utf8");
   console.log(`Combined:\n- ${combinedPath}`);
+
+  if (recoverableErrors.length) {
+    console.warn(`[getUserData] completed with ${recoverableErrors.length} recoverable error(s).`);
+  }
 
   await convertMP4toMP3();
   await sleep(1000);
@@ -1027,9 +1064,22 @@ async function convertMP4toMP3() {
   }
 
   if (changed) {
-    await saveAllReels(reels);
-    await updateUserProfiles();
-    await updateContentReels();
+    try {
+      await saveAllReels(reels);
+      console.log("Allreel.json updated with MP3 paths and server URLs.");
+    } catch (err) {
+      console.error("Failed to save Allreel.json:", err.message);
+    }
+    try {
+      await updateUserProfiles();
+    } catch (err) {
+      console.error("updateUserProfiles crashed:", err.message);
+    }
+    try {
+      await updateContentReels();
+    } catch (err) {
+      console.error("updateContentReels crashed:", err.message);
+    }
     userDataRetrival = false;
     console.log("Allreel.json updated.");
   } else {
