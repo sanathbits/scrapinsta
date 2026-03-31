@@ -1137,6 +1137,12 @@ async function convertMP4toMP3() {
       let serverMP4Url = await uploadFileToServer(inputPath);
       entry.serverMP4Url = serverMP4Url;
 
+      //create a thumbnail for the video
+      const thumbnailPath = entry.filePath.replace(/\.[^/.]+$/, "") + ".jpg";
+      await execAsync(`"${ffmpegPath}" -i "${inputPath}" -ss 00:00:01 -vframes 1 "${thumbnailPath}"`);
+      const thumbnailUrl = await uploadImageFromUrlToServer(thumbnailPath);
+      entry.thumbnailVideoUrl = thumbnailUrl;
+
       if (entry.thumbnailUrl) {
         const uploadedThumb = await uploadImageFromUrlToServer(entry.thumbnailUrl);
         if (uploadedThumb) entry.thumbnailUrl = uploadedThumb;
